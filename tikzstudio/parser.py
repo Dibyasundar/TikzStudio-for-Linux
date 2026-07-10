@@ -1,0 +1,386 @@
+"""Parse TikZ code back into Elements (code -> canvas direction).
+
+The parser handles the subset of TikZ that TikZ Studio itself generates
+plus common hand-written variants.  Any statement it cannot understand is
+kept as a RawElement so no user code is ever lost.
+"""
+
+import re
+from typing import List, Optional, Tuple
+
+from .elements import (Style, Element, LineEl, RectEl, CircleEl, EllipseEl,
+                       PolyEl, BezierEl, PlotEl, ArcEl, GridEl, NodeEl,
+                       ImageEl, RawEl, LibraryEl, GroupEl, Figure, TikzDocument)
+
+NUM = r"[-+]?\d*\.?\d+"
+PT = rf"\(\s*({NUM})\s*,\s*({NUM})\s*\)"
+
+
+# ----------------------------------------------------------------------
+# helpers
+# ----------------------------------------------------------------------
+def split_statements(body: str) -> List[str]:
+    """Split a tikzpicture body into statements.
+
+    * statements end with ';' at brace/bracket depth 0
+    * \\begin{scope}...\\end{scope} blocks count as ONE statement
+    * a comment on the same line after ';' is attached to that statement
+      (used for the "% lib:name" markers of library elements)
+    """
+    stmts, cur, depth = [], "", 0
+    i, n = 0, len(body)
+    while i < n:
+        if body.startswith("\\begin{scope}", i) and not cur.strip():
+            j = body.find("\\end{scope}", i)
+            if j != -1:
+                j += len("\\end{scope}")
+                stmt = body[i:j]
+                i = j
+                # trailing comment?
+                k = i
+                while k < n and body[k] in " \t":
+                    k += 1
+                if k < n and body[k] == "%":
+                    e = body.find("\n", k)
+                    e = n if e == -1 else e
+                    stmt += " " + body[k:e].strip()
+                    i = e
+                stmts.append(stmt.strip())
+                continue
+        ch = body[i]
+        if ch == "%":                       # comment
+            j = body.find("\n", i)
+            j = n if j == -1 else j
+            if cur.strip():
+                cur += body[i:j]
+            else:
+                stmts.append(body[i:j])
+            i = j + 1
+            continue
+        cur += ch
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            # attach same-line trailing comment (lib markers)
+            k = i + 1
+            while k < n and body[k] in " \t":
+                k += 1
+            if k < n and body[k] == "%":
+                e = body.find("\n", k)
+                e = n if e == -1 else e
+                cur += " " + body[k:e].strip()
+                i = e
+            stmts.append(cur.strip())
+            cur = ""
+        i += 1
+    if cur.strip():
+        stmts.append(cur.strip())
+    return [st for st in stmts if st.strip()]
+
+
+def split_top_commas(s: str) -> List[str]:
+    out, cur, depth = [], "", 0
+    for ch in s:
+        if ch in "{([":
+            depth += 1
+        elif ch in "})]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur.strip()); cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
+KNOWN_COLORS = {"black", "white", "red", "green", "blue", "cyan", "magenta",
+                "yellow", "gray", "grey", "darkgray", "lightgray", "brown",
+                "lime", "olive", "orange", "pink", "purple", "teal", "violet"}
+
+
+def parse_options(opt: str, style: Style) -> List[str]:
+    """Fill `style` from an option string; return options we did not use."""
+    leftovers = []
+    for item in split_top_commas(opt):
+        it = item.strip()
+        low = it.lower()
+        if it != "-" and re.fullmatch(
+                r"(<|Stealth|Latex|stealth|latex)?-"
+                r"(>|Stealth|Latex|stealth|latex)?", it):
+            style.arrows = it
+        elif low in ("dashed", "dotted", "solid"):
+            style.dash = low
+        elif low.startswith("color="):
+            style.draw = it[6:].strip()
+        elif low.startswith("draw=") :
+            style.draw = it[5:].strip()
+        elif low.startswith("fill="):
+            style.fill = it[5:].strip()
+        elif low.startswith("line width="):
+            m = re.match(rf"line width\s*=\s*({NUM})\s*pt?", it, re.I)
+            if m:
+                style.line_width = float(m.group(1))
+            else:
+                leftovers.append(it)
+        elif low.startswith("fill opacity="):
+            try:
+                style.fill_opacity = float(it.split("=", 1)[1])
+            except ValueError:
+                leftovers.append(it)
+        elif low.startswith("opacity="):
+            try:
+                style.opacity = float(it.split("=", 1)[1])
+            except ValueError:
+                leftovers.append(it)
+        elif low in ("thin", "thick", "very thick", "ultra thick",
+                     "very thin", "ultra thin", "semithick"):
+            style.line_width = {"ultra thin": 0.1, "very thin": 0.2,
+                                "thin": 0.4, "semithick": 0.6, "thick": 0.8,
+                                "very thick": 1.2, "ultra thick": 1.6}[low]
+        elif it.split("!")[0] in KNOWN_COLORS or it.startswith("rgb,"):
+            style.draw = it
+        else:
+            leftovers.append(it)
+    return leftovers
+
+
+def extract_opts(stmt: str, cmd: str) -> Tuple[str, str]:
+    """Return (options, rest) for '\\cmd[opts] rest;'."""
+    s = stmt[len(cmd):].lstrip()
+    if s.startswith("["):
+        depth, i = 0, 0
+        for i, ch in enumerate(s):
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    break
+        return s[1:i], s[i + 1:].strip()
+    return "", s
+
+
+# ----------------------------------------------------------------------
+# statement parsers
+# ----------------------------------------------------------------------
+def parse_statement(stmt: str) -> Element:
+    try:
+        el = _parse_statement(stmt)
+        return el if el is not None else RawEl(code=stmt)
+    except Exception:
+        return RawEl(code=stmt)
+
+
+LIB_MARK = re.compile(r"^(.*?)\s*%\s*lib:(.+?)\s*$", re.S)
+
+
+def _parse_statement(stmt: str) -> Optional[Element]:
+    s = stmt.strip()
+    if s.startswith("%"):
+        return RawEl(code=s)
+
+    m = LIB_MARK.match(s)
+    if m:
+        from .library import REGISTRY
+        shape = REGISTRY.get(m.group(2).strip())
+        if shape is not None:
+            xy = shape.match(m.group(1))
+            if xy is not None:
+                return LibraryEl(name=shape.name, template=shape.template,
+                                 x=xy[0], y=xy[1])
+        return RawEl(code=s)      # marker but unmatched -> keep verbatim
+
+    if s.startswith("\\begin{scope}"):
+        return _parse_scope(s)
+    if s.startswith("\\node"):
+        return _parse_node(s)
+    if not (s.startswith("\\draw") or s.startswith("\\filldraw")
+            or s.startswith("\\fill") or s.startswith("\\path")):
+        return None
+
+    cmd = "\\" + re.match(r"\\(\w+)", s).group(1)
+    opt, rest = extract_opts(s, cmd)
+    style = Style()
+    if cmd == "\\fill" or cmd == "\\filldraw":
+        style.fill = "black"
+    leftovers = parse_options(opt, style)
+    rest = rest.rstrip(";").strip()
+
+    # grid ---------------------------------------------------------------
+    m = re.fullmatch(rf"{PT}\s+grid\s+{PT}", rest)
+    if m:
+        step = 0.5
+        kept = []
+        for lo in leftovers:
+            mm = re.match(rf"step\s*=\s*({NUM})", lo)
+            if mm:
+                step = float(mm.group(1))
+            else:
+                kept.append(lo)
+        if kept:
+            return None
+        g = GridEl(style=style, step=step)
+        g.x1, g.y1, g.x2, g.y2 = map(float, m.groups())
+        return g
+
+    if leftovers:          # unknown options -> keep raw to stay lossless
+        return None
+
+    # rectangle ------------------------------------------------------------
+    m = re.fullmatch(rf"{PT}\s+rectangle\s+{PT}", rest)
+    if m:
+        r = RectEl(style=style)
+        r.x1, r.y1, r.x2, r.y2 = map(float, m.groups())
+        return r
+
+    # circle ----------------------------------------------------------------
+    m = re.fullmatch(rf"{PT}\s+circle\s*(?:\(\s*({NUM})\s*(?:cm)?\s*\)|\[radius\s*=\s*({NUM})\s*\])", rest)
+    if m:
+        c = CircleEl(style=style)
+        c.cx, c.cy = float(m.group(1)), float(m.group(2))
+        c.r = float(m.group(3) or m.group(4))
+        return c
+
+    # ellipse -----------------------------------------------------------------
+    m = re.fullmatch(rf"{PT}\s+ellipse\s*\(\s*({NUM})\s*and\s*({NUM})\s*\)", rest)
+    if m:
+        e = EllipseEl(style=style)
+        e.cx, e.cy, e.rx, e.ry = map(float, m.groups())
+        return e
+
+    # arc ------------------------------------------------------------------
+    m = re.fullmatch(rf"{PT}\s+arc\s*\(\s*({NUM})\s*:\s*({NUM})\s*:\s*({NUM})\s*\)", rest)
+    if m:
+        import math
+        sx, sy, a1, a2, r = map(float, m.groups())
+        a = ArcEl(style=style, r=r, a1=a1, a2=a2)
+        a.cx = sx - r * math.cos(math.radians(a1))
+        a.cy = sy - r * math.sin(math.radians(a1))
+        return a
+
+    # bezier ------------------------------------------------------------------
+    m = re.fullmatch(
+        rf"{PT}\s*\.\.\s*controls\s*{PT}\s*and\s*{PT}\s*\.\.\s*{PT}", rest)
+    if m:
+        b = BezierEl(style=style)
+        (b.x1, b.y1, b.c1x, b.c1y, b.c2x, b.c2y, b.x2, b.y2) = map(float, m.groups())
+        return b
+
+    # plot / freehand ---------------------------------------------------------
+    m = re.fullmatch(r"plot\s*\[\s*smooth\s*\]\s*coordinates\s*\{(.*)\}", rest, re.S)
+    if m:
+        pts = re.findall(PT, m.group(1))
+        if pts:
+            return PlotEl(style=style, points=[(float(a), float(b)) for a, b in pts])
+
+    # polyline / polygon / simple line -----------------------------------------
+    if re.fullmatch(rf"{PT}(\s*--\s*{PT})+(\s*--\s*cycle)?", rest):
+        closed = rest.rstrip().endswith("cycle")
+        pts = [(float(a), float(b)) for a, b in re.findall(PT, rest)]
+        if len(pts) == 2 and not closed:
+            l = LineEl(style=style)
+            (l.x1, l.y1), (l.x2, l.y2) = pts
+            return l
+        return PolyEl(style=style, points=pts, closed=closed)
+
+    return None
+
+
+def _parse_scope(s: str) -> Optional[Element]:
+    m = re.fullmatch(
+        r"\\begin\{scope\}\s*(?:\[(?P<opt>.*?)\])?\s*"
+        r"(?P<body>.*)\\end\{scope\}\s*", s, re.S)
+    if not m:
+        return None
+    x = y = 0.0
+    sc = 1.0
+    for it in split_top_commas(m.group("opt") or ""):
+        it = it.strip()
+        if not it:
+            continue
+        mm = re.fullmatch(
+            rf"shift\s*=\s*\{{\(\s*({NUM})\s*,\s*({NUM})\s*\)\}}", it)
+        if mm:
+            x, y = float(mm.group(1)), float(mm.group(2))
+            continue
+        mm = re.fullmatch(rf"scale\s*=\s*({NUM})", it)
+        if mm:
+            sc = float(mm.group(1))
+            continue
+        return None            # unknown scope option -> keep raw
+    return GroupEl(children=parse_body(m.group("body")), x=x, y=y, s=sc)
+
+
+def _parse_node(s: str) -> Optional[Element]:
+    opt, rest = extract_opts(s, "\\node")
+    m = re.fullmatch(rf"at\s*{PT}\s*\{{(.*)\}}\s*;?", rest.strip(), re.S)
+    if not m:
+        return None
+    x, y, content = float(m.group(1)), float(m.group(2)), m.group(3)
+
+    # image node?
+    mi = re.fullmatch(
+        rf"\\includegraphics\[width\s*=\s*({NUM})\s*cm\]\{{(.+?)\}}",
+        content.strip())
+    if mi and not opt:
+        return ImageEl(x=x, y=y, width=float(mi.group(1)), path=mi.group(2))
+
+    style = Style()
+    leftovers = parse_options(opt, style)
+    shape, border = "", False
+    kept = []
+    for lo in leftovers:
+        if lo == "draw":
+            border = True
+        elif lo in ("rectangle", "circle", "ellipse", "star",
+                    "diamond", "regular polygon", "cloud"):
+            shape = lo
+        else:
+            kept.append(lo)
+    if kept:
+        return None
+    return NodeEl(style=style, x=x, y=y, text=content,
+                  shape=shape, draw_border=border)
+
+
+# ----------------------------------------------------------------------
+# figure / document level
+# ----------------------------------------------------------------------
+def parse_body(body: str) -> List[Element]:
+    return [parse_statement(st) for st in split_statements(body)]
+
+
+TIKZPIC_RE = re.compile(
+    r"\\begin\{tikzpicture\}(\[[^\]]*\])?(.*?)\\end\{tikzpicture\}", re.S)
+
+
+def import_tex(text: str) -> TikzDocument:
+    """Import a full .tex file: preamble packages + all tikzpictures."""
+    doc = TikzDocument()
+    doc.figures = []
+    doc.packages = []
+    doc.tikz_libraries = []
+
+    m = re.search(r"\\documentclass\[([^\]]*)\]\{standalone\}", text)
+    if m:
+        doc.doc_class_options = m.group(1)
+    for m in re.finditer(r"\\usepackage(?:\[[^\]]*\])?\{([^}]*)\}", text):
+        for p in m.group(1).split(","):
+            if p.strip() and p.strip() != "tikz":
+                doc.packages.append(p.strip())
+    for m in re.finditer(r"\\usetikzlibrary\{([^}]*)\}", text):
+        doc.tikz_libraries += [l.strip() for l in m.group(1).split(",") if l.strip()]
+    if not doc.tikz_libraries:
+        doc.tikz_libraries = ["arrows.meta"]
+
+    for i, m in enumerate(TIKZPIC_RE.finditer(text), start=1):
+        fig = Figure(name=f"figure{i}")
+        fig.env_options = (m.group(1) or "").strip("[]")
+        fig.elements = parse_body(m.group(2))
+        doc.figures.append(fig)
+    if not doc.figures:
+        doc.figures = [Figure()]
+    return doc
