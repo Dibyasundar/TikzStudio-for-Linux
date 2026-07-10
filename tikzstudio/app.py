@@ -6,7 +6,8 @@ import shutil
 import subprocess
 
 from PyQt6.QtCore import Qt, QTimer, QThread, QSize
-from PyQt6.QtGui import QAction, QKeySequence, QPixmap, QColor, QActionGroup
+from PyQt6.QtGui import (QAction, QKeySequence, QPixmap, QColor,
+                         QActionGroup, QIcon, QPainter, QFont)
 from PyQt6.QtWidgets import (QMainWindow, QToolBar, QDockWidget, QLabel,
                              QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QTabBar, QFileDialog, QMessageBox, QComboBox,
@@ -22,6 +23,7 @@ from .elements import (TikzDocument, Figure, Style, NodeEl, ImageEl, GridEl,
                        CALLOUT_TEMPLATE)
 from . import library as libmod
 from .library import REGISTRY, LibraryBuilder, compile_custom
+from .textformat import parse_format, apply_format, SIZES
 from .parser import parse_body, import_tex
 from .canvas import Canvas, TOOLS
 from .editor import TikzEditor
@@ -46,6 +48,19 @@ TOOL_LABELS = {
 }
 
 
+def glyph_icon(char: str, color="#1f2937", pt=15) -> QIcon:
+    pm = QPixmap(26, 26)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    f = QFont("DejaVu Sans", pt)
+    p.setFont(f)
+    p.setPen(QColor(color))
+    p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, char)
+    p.end()
+    return QIcon(pm)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -64,6 +79,7 @@ class MainWindow(QMainWindow):
         self.canvas.selection_changed.connect(self._show_properties)
         self.canvas.status.connect(lambda s: self.statusBar().showMessage(s, 4000))
         self.canvas.place_requested.connect(self._place_library_element)
+        self.canvas.jump_to_code.connect(self._jump_to_code)
         self._pending_shape = None
 
         # central widget = figure tab bar + canvas
@@ -109,57 +125,87 @@ class MainWindow(QMainWindow):
     # ==================================================================
     def _build_toolbar(self):
         tb = QToolBar("Tools"); tb.setMovable(False)
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb)
         group = QActionGroup(self); group.setExclusive(True)
-        shortcuts = {"select": "S", "line": "L", "arrow": "A", "rect": "R",
+        self.tool_actions = {}
+        shortcuts = {"select": "S", "line": "L", "rect": "R",
                      "circle": "C", "ellipse": "E", "polygon": "P",
                      "bezier": "B", "freehand": "F", "node": "N"}
         for tool in TOOLS:
             icon, tip = TOOL_LABELS[tool]
             if tool == "arrow":
-                # dropdown: straight arrow / multipoint arrow
                 btn = QToolButton()
-                btn.setText("→ Arrow")
-                btn.setToolTip("Arrows: straight (drag) or multipoint "
-                               "(click waypoints, double-click to finish)")
+                btn.setIcon(glyph_icon("→"))
+                btn.setToolTip("Arrows — straight (drag) or multipoint "
+                               "(dropdown; click waypoints, double-click "
+                               "to finish)   [A]")
                 btn.setPopupMode(
                     QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+                btn.setCheckable(True)
                 menu = QMenu(btn)
-                a1 = menu.addAction("→ Straight arrow  (A)")
-                a2 = menu.addAction("↝ Multipoint arrow")
+                a1 = menu.addAction(glyph_icon("→"), "Straight arrow  (A)")
+                a2 = menu.addAction(glyph_icon("↝"), "Multipoint arrow")
                 a1.triggered.connect(
-                    lambda: (btn.setText("→ Arrow"),
+                    lambda: (btn.setIcon(glyph_icon("→")),
                              self.canvas.set_tool("arrow")))
                 a2.triggered.connect(
-                    lambda: (btn.setText("↝ Multi-arrow"),
+                    lambda: (btn.setIcon(glyph_icon("↝")),
                              self.canvas.set_tool("multiarrow")))
                 btn.setMenu(menu)
                 btn.clicked.connect(
-                    lambda: self.canvas.set_tool(
-                        "multiarrow" if btn.text().startswith("↝")
-                        else "arrow"))
+                    lambda: self.canvas.set_tool(self._arrow_variant))
+                self._arrow_variant = "arrow"
+                a1.triggered.connect(
+                    lambda: setattr(self, "_arrow_variant", "arrow"))
+                a2.triggered.connect(
+                    lambda: setattr(self, "_arrow_variant", "multiarrow"))
                 arr_short = QAction(self)
                 arr_short.setShortcut("A")
                 arr_short.triggered.connect(
                     lambda: self.canvas.set_tool("arrow"))
                 self.addAction(arr_short)
                 tb.addWidget(btn)
+                self._arrow_btn = btn
                 continue
-            act = QAction(f"{icon} {tool.capitalize()}", self)
+            act = QAction(glyph_icon(icon), tool.capitalize(), self)
             act.setCheckable(True)
-            act.setToolTip(tip)
+            act.setToolTip(tip + (f"   [{shortcuts[tool]}]"
+                                  if tool in shortcuts else ""))
             if tool in shortcuts:
                 act.setShortcut(shortcuts[tool])
-            act.triggered.connect(lambda _=False, t=tool: self.canvas.set_tool(t))
+            act.triggered.connect(
+                lambda _=False, t=tool: self.canvas.set_tool(t))
             group.addAction(act); tb.addAction(act)
+            self.tool_actions[tool] = act
             if tool == "select":
                 act.setChecked(True)
+        self.canvas.tool_changed.connect(self._tool_changed_ui)
         tb.addSeparator()
 
-        run = QAction("▶ Compile (F5)", self)
-        run.setShortcut("F5")
-        run.triggered.connect(self.compile)
-        tb.addAction(run)
+        # scope grouping buttons
+        grp = QAction(glyph_icon("⧉"), "Group into scope", self)
+        grp.setToolTip("Group the selected elements into a "
+                       "\\begin{scope} — move / scale / rotate them "
+                       "together   [Ctrl+G]")
+        grp.triggered.connect(self.group_selection)
+        tb.addAction(grp)
+        ung = QAction(glyph_icon("⧈"), "Ungroup scope", self)
+        ung.setToolTip("Ungroup the selected scope, baking its transform "
+                       "into the elements   [Ctrl+Shift+G]")
+        ung.triggered.connect(self.ungroup_selection)
+        tb.addAction(ung)
+        tb.addSeparator()
+
+        # ONE compile action shared by toolbar and menu (two separate
+        # F5 shortcuts made Qt treat the key as ambiguous and drop it)
+        self.compile_action = QAction(glyph_icon("▶", "#047857"),
+                                      "Compile", self)
+        self.compile_action.setShortcut("F5")
+        self.compile_action.setToolTip("Compile with pdflatex and show the "
+                                       "PDF preview   [F5]")
+        self.compile_action.triggered.connect(self.compile)
+        tb.addAction(self.compile_action)
         self.auto_cb = QCheckBox("Auto-compile")
         tb.addWidget(self.auto_cb)
         snap = QCheckBox("Snap"); snap.setChecked(True)
@@ -179,6 +225,12 @@ class MainWindow(QMainWindow):
                                   "for precise drawing")
         self.grid_spin.valueChanged.connect(self._set_grid_step)
         tb.addWidget(self.grid_spin)
+
+    def _tool_changed_ui(self, tool):
+        if tool in self.tool_actions:
+            self.tool_actions[tool].setChecked(True)
+        if hasattr(self, "_arrow_btn"):
+            self._arrow_btn.setChecked(tool in ("arrow", "multiarrow"))
 
     def _toggle_grid(self, b):
         self.canvas.show_grid = b
@@ -213,6 +265,7 @@ class MainWindow(QMainWindow):
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#6b7280; font-size:11px;")
         lay.addWidget(hint); lay.addWidget(self.editor, 1)
+        self.editor.jump_handler = self._jump_to_canvas
         dock = QDockWidget("TikZ code", self)
         dock.setWidget(w)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
@@ -258,6 +311,32 @@ class MainWindow(QMainWindow):
             lambda v: self._set_style("fill_opacity", v))
         self.props_form.addRow("Fill opacity", self.p_fop)
 
+        # LaTeX text formatting for the selected node
+        fmt_row = QHBoxLayout()
+        self.p_bold = QPushButton("B"); self.p_bold.setCheckable(True)
+        self.p_bold.setStyleSheet("font-weight:bold;")
+        self.p_italic = QPushButton("I"); self.p_italic.setCheckable(True)
+        self.p_italic.setStyleSheet("font-style:italic;")
+        self.p_under = QPushButton("U"); self.p_under.setCheckable(True)
+        self.p_under.setStyleSheet("text-decoration:underline;")
+        for b in (self.p_bold, self.p_italic, self.p_under):
+            b.setMaximumWidth(30)
+            b.toggled.connect(self._apply_text_format)
+        self.p_tcolor = QPushButton("A")
+        self.p_tcolor.setMaximumWidth(30)
+        self.p_tcolor.setToolTip("Text colour (\\textcolor)")
+        self.p_tcolor.clicked.connect(self._pick_text_color)
+        fmt_row.addWidget(self.p_bold); fmt_row.addWidget(self.p_italic)
+        fmt_row.addWidget(self.p_under); fmt_row.addWidget(self.p_tcolor)
+        fmt_row.addStretch()
+        fw = QWidget(); fw.setLayout(fmt_row)
+        self.props_form.addRow("Text format", fw)
+        self.p_tsize = QComboBox(); self.p_tsize.addItems(SIZES)
+        self.p_tsize.setCurrentText("normalsize")
+        self.p_tsize.currentTextChanged.connect(
+            lambda _: self._apply_text_format())
+        self.props_form.addRow("Text size", self.p_tsize)
+
         self.p_star_n = QSpinBox(); self.p_star_n.setRange(3, 12); self.p_star_n.setValue(5)
         self.p_star_n.valueChanged.connect(
             lambda v: setattr(self.canvas, "star_points", v))
@@ -289,6 +368,19 @@ class MainWindow(QMainWindow):
         self.p_scale.setToolTip("Scale of the selected scope group")
         self.p_scale.valueChanged.connect(lambda v: self._set_attr("s", v))
         self.props_form.addRow("Group scale", self.p_scale)
+        self.p_grot = QDoubleSpinBox(); self.p_grot.setRange(-360, 360)
+        self.p_grot.valueChanged.connect(lambda v: self._set_attr("rot", v))
+        self.props_form.addRow("Group rotate °", self.p_grot)
+        self.p_gxs = QDoubleSpinBox(); self.p_gxs.setRange(-20, 20)
+        self.p_gxs.setValue(1.0); self.p_gxs.setSingleStep(0.1)
+        self.p_gxs.setToolTip("xscale (negative mirrors horizontally)")
+        self.p_gxs.valueChanged.connect(lambda v: self._set_attr("xs", v))
+        self.props_form.addRow("Group xscale", self.p_gxs)
+        self.p_gys = QDoubleSpinBox(); self.p_gys.setRange(-20, 20)
+        self.p_gys.setValue(1.0); self.p_gys.setSingleStep(0.1)
+        self.p_gys.setToolTip("yscale (negative mirrors vertically)")
+        self.p_gys.valueChanged.connect(lambda v: self._set_attr("ys", v))
+        self.props_form.addRow("Group yscale", self.p_gys)
 
         self.sel_label = QLabel("New shapes use these style settings.\n"
                                 "Select one element to edit it.")
@@ -351,7 +443,7 @@ class MainWindow(QMainWindow):
         e.addAction(self._act("Uncomment lines (editor)", "Ctrl+R",
                               lambda: self.editor._comment_selection(False)))
         e.addSeparator()
-        e.addAction(self._act("Delete selection", "Del",
+        e.addAction(self._act("Delete selection", None,
                               self.canvas.delete_selected))
         e.addAction(self._act("Select all", "Ctrl+A",
                               lambda: [i.setSelected(True)
@@ -381,7 +473,7 @@ class MainWindow(QMainWindow):
         ins.addAction(self._act("Image…", None, self._insert_image))
 
         b = m.addMenu("&Build")
-        b.addAction(self._act("Compile", "F5", self.compile))
+        b.addAction(self.compile_action)
 
         h = m.addMenu("&Help")
         h.addAction(self._act("About", None, self._about))
@@ -550,6 +642,16 @@ class MainWindow(QMainWindow):
         self.p_arrow.setCurrentText(st.arrows)
         self.p_op.setValue(st.opacity)
         self.p_fop.setValue(st.fill_opacity)
+        is_node = isinstance(element, NodeEl)
+        for wdg in (self.p_bold, self.p_italic, self.p_under,
+                    self.p_tcolor, self.p_tsize):
+            wdg.setEnabled(is_node)
+        if is_node:
+            fmt = parse_format(element.text)
+            self.p_bold.setChecked(fmt.bold)
+            self.p_italic.setChecked(fmt.italic)
+            self.p_under.setChecked(fmt.underline)
+            self.p_tsize.setCurrentText(fmt.size)
         self._paint_color_buttons(st)
         is_arc = isinstance(element, ArcEl)
         is_grid = isinstance(element, GridEl)
@@ -559,8 +661,13 @@ class MainWindow(QMainWindow):
         self.p_step.setEnabled(is_grid); self.p_imgw.setEnabled(is_img)
         self.p_imgh.setEnabled(is_img)
         self.p_scale.setEnabled(is_grp)
+        for wdg in (self.p_grot, self.p_gxs, self.p_gys):
+            wdg.setEnabled(is_grp)
         if is_grp:
             self.p_scale.setValue(element.s)
+            self.p_grot.setValue(element.rot)
+            self.p_gxs.setValue(element.xs)
+            self.p_gys.setValue(element.ys)
         if is_arc:
             self.p_a1.setValue(element.a1); self.p_a2.setValue(element.a2)
         if is_grid:
@@ -582,6 +689,116 @@ class MainWindow(QMainWindow):
                 "Drag the square handles to reshape. Arrow keys nudge "
                 "(plain 0.05 cm, Shift = one grid cell, Ctrl = 0.01 cm).")
         self._syncing = False
+
+    # ==================================================================
+    # jump: canvas element <-> code line
+    # ==================================================================
+    def _element_line_spans(self):
+        spans, ln = [], 0
+        for el in self.fig().elements:
+            n = el.to_tikz().count("\n") + 1
+            spans.append((el, ln, n))
+            ln += n
+        return spans
+
+    def _jump_to_code(self, element):
+        if getattr(self, "code_mode", "figure") == "document":
+            self.mode_combo.setCurrentIndex(0)     # jump works on figure body
+        for el, start, n in self._element_line_spans():
+            if el is element:
+                from PyQt6.QtGui import QTextCursor
+                block = self.editor.document().findBlockByNumber(start)
+                cur = QTextCursor(block)
+                cur.movePosition(QTextCursor.MoveOperation.EndOfBlock,
+                                 QTextCursor.MoveMode.KeepAnchor)
+                for _ in range(n - 1):
+                    cur.movePosition(QTextCursor.MoveOperation.Down,
+                                     QTextCursor.MoveMode.KeepAnchor)
+                    cur.movePosition(QTextCursor.MoveOperation.EndOfBlock,
+                                     QTextCursor.MoveMode.KeepAnchor)
+                self.editor.setTextCursor(cur)
+                self.editor.setFocus()
+                self.code_dock.raise_()
+                self.statusBar().showMessage(
+                    f"Code line {start + 1}: "
+                    f"{type(element).__name__.replace('El', '')}", 4000)
+                return
+        self.statusBar().showMessage("Element not found in this figure.", 3000)
+
+    def _jump_to_canvas(self, line: int):
+        if getattr(self, "code_mode", "figure") == "document":
+            self.statusBar().showMessage(
+                "Switch to 'Current figure body' mode to jump to elements.",
+                4000)
+            return
+        self._flush_pending_code()
+        for el, start, n in self._element_line_spans():
+            if start <= line < start + n:
+                if isinstance(el, RawEl):
+                    self.statusBar().showMessage(
+                        "That statement is raw TikZ — it compiles but has "
+                        "no canvas element.", 4000)
+                    return
+                scene = self.canvas.scene()
+                scene.clearSelection()
+                from .canvas import ElementItem
+                for it in scene.items():
+                    if isinstance(it, ElementItem) and it.element is el:
+                        it.setSelected(True)
+                        self.canvas.centerOn(it)
+                        self.canvas.setFocus()
+                        self.statusBar().showMessage(
+                            f"Selected {type(el).__name__.replace('El','')} "
+                            "on canvas.", 3000)
+                        return
+        self.statusBar().showMessage("No element on that line.", 3000)
+
+    # ==================================================================
+    # node text formatting (bold / italic / underline / colour / size)
+    # ==================================================================
+    def _selected_node(self):
+        sel = self.canvas.selected_elements()
+        return sel[0] if len(sel) == 1 and isinstance(sel[0], NodeEl) else None
+
+    def _apply_text_format(self):
+        if self._syncing:
+            return
+        n = self._selected_node()
+        if n is None:
+            return
+        fmt = parse_format(n.text)
+        fmt.bold = self.p_bold.isChecked()
+        fmt.italic = self.p_italic.isChecked()
+        fmt.underline = self.p_under.isChecked()
+        fmt.size = self.p_tsize.currentText()
+        n.text = apply_format(fmt)
+        self.canvas.refresh_selected()
+        self._push_code_to_editor()
+        self._push_history()
+
+    def _pick_text_color(self):
+        n = self._selected_node()
+        if n is None:
+            self.statusBar().showMessage(
+                "Select a text node to set its colour.", 3000)
+            return
+        fmt = parse_format(n.text)
+        c = QColorDialog.getColor(QColor(fmt.color.split("!")[0])
+                                  if fmt.color else QColor("black"), self)
+        if not c.isValid():
+            return
+        named = {"#000000": "", "#ff0000": "red", "#00ff00": "green",
+                 "#0000ff": "blue", "#ffffff": "white",
+                 "#ffff00": "yellow", "#00ffff": "cyan",
+                 "#ff00ff": "magenta", "#ff8000": "orange",
+                 "#808080": "gray"}
+        fmt.color = named.get(
+            c.name(),
+            f"{{rgb,255:red,{c.red()};green,{c.green()};blue,{c.blue()}}}")
+        n.text = apply_format(fmt)
+        self.canvas.refresh_selected()
+        self._push_code_to_editor()
+        self._push_history()
 
     # ==================================================================
     # undo / redo (canvas-level history; editor has its own stack)
@@ -661,10 +878,16 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Select one scope to ungroup.", 4000)
             return
         g = sel[0]
+        if abs(g.rot) > 1e-9 or abs(g.xs - g.ys) > 1e-9:
+            self.statusBar().showMessage(
+                "Rotated or x/y-scaled scopes can't be baked into plain "
+                "coordinates — set rotate=0 and xscale=yscale first.", 6000)
+            return
         idx = self.fig().elements.index(g)
         expanded, kept_raw = [], 0
+        uni = g.s * g.xs
         for c in g.children:
-            if c.bake(g.s, g.x, g.y):
+            if c.bake(uni, g.x, g.y):
                 expanded.append(c)
             else:
                 expanded.append(c)      # raw child: keep verbatim, untransformed
@@ -782,7 +1005,9 @@ class MainWindow(QMainWindow):
         self.fig().elements.append(
             LibraryEl(name=sh.name, template=sh.template, x=x, y=y))
         self.canvas.rebuild_scene()
+        self.canvas.set_tool("select")
         self._push_code_to_editor()
+        self._push_history()
         if self.auto_cb.isChecked():
             self._auto_timer.start()
 

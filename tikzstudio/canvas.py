@@ -10,9 +10,10 @@ from PyQt6.QtGui import (QPainter, QPen, QBrush, QColor, QPainterPath,
                          QPixmap, QFont, QTransform, QFontMetricsF)
 from PyQt6.QtWidgets import (QGraphicsView, QGraphicsScene, QGraphicsItem,
                              QGraphicsPathItem, QGraphicsRectItem,
-                             QInputDialog, QFileDialog)
+                             QInputDialog, QFileDialog, QMenu)
 
 from .mathtext import latex_to_unicode
+from .textformat import parse_format, SIZE_PTS
 from .elements import (SCALE, Style, Element, LineEl, RectEl, CircleEl,
                        EllipseEl, PolyEl, BezierEl, PlotEl, ArcEl, GridEl,
                        NodeEl, ImageEl, RawEl, LibraryEl, GroupEl, Figure)
@@ -241,15 +242,20 @@ ALIGN_FLAGS = {"left": Qt.AlignmentFlag.AlignLeft,
 
 
 def node_box(e: NodeEl):
-    """Layout of a node: (display text, font, local QRectF, text flags).
+    """Layout of a node: (display text, font, local QRectF, text flags,
+    text colour).
 
     The rect is in scene px, in a local frame whose origin is the node's
     "at" coordinate (rotation applied separately by the painter).
     """
-    disp = latex_to_unicode(e.text).replace("\\\\", "\n")
-    pt_size = max(1, round(9 * (e.scale if e.scale > 0 else 1)))
+    fmt = parse_format(e.text)
+    disp = latex_to_unicode(fmt.inner).replace("\\\\", "\n")
+    base = SIZE_PTS.get(fmt.size, 9)
+    pt_size = max(1, round(base * (e.scale if e.scale > 0 else 1)))
     font = QFont("DejaVu Sans", pt_size)
-    font.setItalic("$" in e.text)
+    font.setBold(fmt.bold)
+    font.setUnderline(fmt.underline)
+    font.setItalic(fmt.italic or "$" in fmt.inner)
     fm = QFontMetricsF(font)
     halign = ALIGN_FLAGS.get(e.align, Qt.AlignmentFlag.AlignHCenter)
     flags = int(halign | Qt.AlignmentFlag.AlignVCenter)
@@ -280,7 +286,7 @@ def node_box(e: NodeEl):
     if "south" in a:
         dy = -h / 2
     rect = QRectF(dx - w / 2, dy - h / 2, w, h)
-    return disp, font, rect, flags
+    return disp, font, rect, flags, fmt.color
 
 
 def node_transform(e: NodeEl) -> QTransform:
@@ -315,7 +321,7 @@ class HandleItem(QGraphicsRectItem):
 
     def mouseMoveEvent(self, ev):
         canvas = self.owner.canvas
-        x, y = from_scene(ev.scenePos())
+        x, y = from_scene(self.owner.mapFromScene(ev.scenePos()))
         if canvas.snap:
             g = max(canvas.grid_step, 0.01)
             x, y = round(x / g) * g, round(y / g) * g
@@ -395,6 +401,15 @@ class ElementItem(QGraphicsPathItem):
         self.setOpacity(st.opacity)
         self.setPath(element_path(e, self.canvas))
         self._heads = arrow_heads(e)
+        # TikZ coordinate transforms ([shift, rotate, xscale, yscale, ...])
+        if st.has_transform():
+            t = QTransform()
+            t.translate(st.tf_x * SCALE, -st.tf_y * SCALE)
+            t.rotate(-st.tf_rot)
+            t.scale(st.tf_sx, st.tf_sy)
+            self.setTransform(t)
+        else:
+            self.setTransform(QTransform())
 
     # -- reshape handles --------------------------------------------------
     def show_handles(self):
@@ -418,7 +433,7 @@ class ElementItem(QGraphicsPathItem):
     def boundingRect(self) -> QRectF:
         e = self.element
         if isinstance(e, NodeEl):
-            _, _, rect, _ = node_box(e)
+            _, _, rect, _, _ = node_box(e)
             if e.shape == "circle":
                 R = max(rect.width(), rect.height()) / 2 + 3
                 rect = QRectF(rect.center().x() - R, rect.center().y() - R,
@@ -457,7 +472,7 @@ class ElementItem(QGraphicsPathItem):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         if isinstance(e, NodeEl):
             painter.setOpacity(e.style.opacity)
-            disp, font, rect, flags = node_box(e)
+            disp, font, rect, flags, tcolor = node_box(e)
             painter.save()
             painter.setTransform(node_transform(e), True)
             if e.style.fill:
@@ -472,7 +487,7 @@ class ElementItem(QGraphicsPathItem):
                                  e.style.draw_opacity),
                     max(e.style.line_width * 1.6, 1.0)))
                 self._node_shape(painter, e, rect)
-            painter.setPen(QPen(qcolor(e.style.draw or "black")))
+            painter.setPen(QPen(qcolor(tcolor or e.style.draw or "black")))
             painter.setFont(font)
             painter.drawText(rect.adjusted(4, 2, -4, -2), flags, disp)
             painter.restore()
@@ -581,10 +596,11 @@ class GroupItem(ElementItem):
             it.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
             it.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
             it.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-        # shift + scale:  p' = shift + s * p
+        # tikz applies options in order: [shift, rotate, scale, x/yscale]
         t = QTransform()
         t.translate(e.x * SCALE, -e.y * SCALE)
-        t.scale(e.s, e.s)
+        t.rotate(-e.rot)
+        t.scale(e.s * e.xs, e.s * e.ys)
         self.setTransform(t)
 
     def boundingRect(self) -> QRectF:
@@ -619,6 +635,8 @@ class Canvas(QGraphicsView):
     selection_changed = pyqtSignal(object)  # Element or None
     status = pyqtSignal(str)
     place_requested = pyqtSignal(float, float)
+    tool_changed = pyqtSignal(str)
+    jump_to_code = pyqtSignal(object)       # element -> highlight its code
 
     def __init__(self):
         super().__init__()
@@ -692,6 +710,7 @@ class Canvas(QGraphicsView):
         elif tool == "multiarrow":
             hint = "  (click waypoints, double-click to finish the arrow)"
         self.status.emit(f"Tool: {tool}{hint}")
+        self.tool_changed.emit(tool)
 
     def load_figure(self, fig: Figure):
         self.figure = fig
@@ -738,7 +757,13 @@ class Canvas(QGraphicsView):
             if isinstance(it, ElementItem) and it.parentItem() is None \
                     and not it.pos().isNull():
                 dx, dy = it.pos().x() / SCALE, -it.pos().y() / SCALE
-                it.element.translate(round(dx, 3), round(dy, 3))
+                st = it.element.style
+                if isinstance(it.element, GroupEl) or not st.has_transform():
+                    it.element.translate(round(dx, 3), round(dy, 3))
+                else:
+                    # outer-most shift moves in parent space directly
+                    st.tf_x = round(st.tf_x + dx, 3)
+                    st.tf_y = round(st.tf_y + dy, 3)
                 it.setPos(0, 0)
                 it.rebuild()
                 it.position_handles()
@@ -948,6 +973,26 @@ class Canvas(QGraphicsView):
             return
         super().keyPressEvent(ev)
 
+    def contextMenuEvent(self, ev):
+        item = self.itemAt(ev.pos())
+        while item is not None and not isinstance(item, ElementItem):
+            item = item.parentItem()
+        menu = QMenu(self)
+        if isinstance(item, ElementItem):
+            top = item
+            while isinstance(top.parentItem(), ElementItem):
+                top = top.parentItem()
+            act = menu.addAction("⇢ Show in code")
+            el = top.element
+            act.triggered.connect(lambda: self.jump_to_code.emit(el))
+            menu.addSeparator()
+            d = menu.addAction("Delete")
+            d.triggered.connect(lambda: (top.setSelected(True),
+                                         self.delete_selected()))
+        sel = menu.addAction("Select tool")
+        sel.triggered.connect(lambda: self.set_tool("select"))
+        menu.exec(ev.globalPos())
+
     # -- previews ---------------------------------------------------------
     def _preview_drag(self, a: QPointF, b: QPointF):
         p = QPainterPath()
@@ -996,6 +1041,13 @@ class Canvas(QGraphicsView):
         self.figure.elements.append(el)
         self.rebuild_scene()
         self.model_changed.emit()
+        # back to select mode once the drawing is complete
+        self.set_tool("select")
+        # keep the fresh element selected for immediate tweaking
+        for it in self._scene.items():
+            if isinstance(it, ElementItem) and it.element is el:
+                it.setSelected(True)
+                break
 
     def _make_star(self, cx, cy, r, st: Style) -> PolyEl:
         n = self.star_points

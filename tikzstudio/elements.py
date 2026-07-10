@@ -34,6 +34,17 @@ class Style:
     fill_opacity: float = 1.0
     draw_opacity: float = 1.0
     extra: List[str] = field(default_factory=list)  # preserved verbatim
+    # per-path TikZ coordinate transforms ([shift/rotate/xscale/...])
+    tf_x: float = 0.0
+    tf_y: float = 0.0
+    tf_rot: float = 0.0
+    tf_sx: float = 1.0
+    tf_sy: float = 1.0
+
+    def has_transform(self) -> bool:
+        return (abs(self.tf_x) > 1e-9 or abs(self.tf_y) > 1e-9
+                or abs(self.tf_rot) > 1e-9
+                or abs(self.tf_sx - 1) > 1e-9 or abs(self.tf_sy - 1) > 1e-9)
 
     def options(self, extra: List[str] = None) -> str:
         o: List[str] = []
@@ -53,6 +64,17 @@ class Style:
             o.append(f"fill opacity={fnum(self.fill_opacity)}")
         if self.draw_opacity < 0.999:
             o.append(f"draw opacity={fnum(self.draw_opacity)}")
+        if abs(self.tf_x) > 1e-9 or abs(self.tf_y) > 1e-9:
+            o.append(f"shift={{({fnum(self.tf_x)},{fnum(self.tf_y)})}}")
+        if abs(self.tf_rot) > 1e-9:
+            o.append(f"rotate={fnum(self.tf_rot)}")
+        if abs(self.tf_sx - self.tf_sy) < 1e-9 and abs(self.tf_sx - 1) > 1e-9:
+            o.append(f"scale={fnum(self.tf_sx)}")
+        else:
+            if abs(self.tf_sx - 1) > 1e-9:
+                o.append(f"xscale={fnum(self.tf_sx)}")
+            if abs(self.tf_sy - 1) > 1e-9:
+                o.append(f"yscale={fnum(self.tf_sy)}")
         if extra:
             o.extend(extra)
         if self.extra:
@@ -63,7 +85,8 @@ class Style:
         return Style(self.draw, self.fill, self.line_width,
                      self.dash, self.arrows, self.opacity,
                      self.fill_opacity, self.draw_opacity,
-                     list(self.extra))
+                     list(self.extra), self.tf_x, self.tf_y,
+                     self.tf_rot, self.tf_sx, self.tf_sy)
 
 
 # ----------------------------------------------------------------------
@@ -463,13 +486,22 @@ class GroupEl(Element):
     with [shift, scale] a child point p maps to  shift + scale * p."""
     children: List[Element] = field(default_factory=list)
     x: float = 0; y: float = 0; s: float = 1.0
+    rot: float = 0.0          # rotate=
+    xs: float = 1.0           # xscale= (multiplies s)
+    ys: float = 1.0           # yscale=
 
     def to_tikz(self):
         opts = []
         if abs(self.x) > 1e-9 or abs(self.y) > 1e-9:
             opts.append(f"shift={{({fnum(self.x)},{fnum(self.y)})}}")
+        if abs(self.rot) > 1e-9:
+            opts.append(f"rotate={fnum(self.rot)}")
         if abs(self.s - 1) > 1e-9:
             opts.append(f"scale={fnum(self.s)}")
+        if abs(self.xs - 1) > 1e-9:
+            opts.append(f"xscale={fnum(self.xs)}")
+        if abs(self.ys - 1) > 1e-9:
+            opts.append(f"yscale={fnum(self.ys)}")
         head = "\\begin{scope}" + (f"[{', '.join(opts)}]" if opts else "")
         inner = "\n".join("  " + c.to_tikz().replace("\n", "\n  ")
                           for c in self.children)

@@ -87,6 +87,7 @@ class TikzEditor(QPlainTextEdit):
 
     def __init__(self):
         super().__init__()
+        self.jump_handler = None      # set by the app: line -> canvas jump
         font = QFont("Monospace", 10)
         font.setStyleHint(QFont.StyleHint.TypeWriter)
         self.setFont(font)
@@ -100,6 +101,21 @@ class TikzEditor(QPlainTextEdit):
             QCompleter.CompletionMode.PopupCompletion)
         self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self.completer.activated.connect(self._insert_completion)
+
+    def contextMenuEvent(self, ev):
+        menu = self.createStandardContextMenu()
+        if self.jump_handler is not None:
+            menu.addSeparator()
+            cur = self.cursorForPosition(ev.pos())
+            line = cur.blockNumber()
+            act = menu.addAction("⇠ Show element on canvas")
+            act.triggered.connect(lambda: self.jump_handler(line))
+            menu.addSeparator()
+            c = menu.addAction("Comment lines\tCtrl+T")
+            c.triggered.connect(lambda: self._comment_selection(True))
+            u = menu.addAction("Uncomment lines\tCtrl+R")
+            u.triggered.connect(lambda: self._comment_selection(False))
+        menu.exec(ev.globalPos())
 
     # -- completion --------------------------------------------------------
     def _word_under_cursor(self) -> str:

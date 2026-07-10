@@ -112,12 +112,55 @@ KNOWN_COLORS = {"black", "white", "red", "green", "blue", "cyan", "magenta",
                 "lime", "olive", "orange", "pink", "purple", "teal", "violet"}
 
 
-def parse_options(opt: str, style: Style) -> List[str]:
-    """Fill `style` from an option string; return options we did not use."""
+def parse_options(opt: str, style: Style,
+                  transforms: bool = True) -> List[str]:
+    """Fill `style` from an option string; return options we did not use.
+
+    With transforms=True, coordinate-transform keys (shift, xshift,
+    yshift, rotate, scale, xscale, yscale) are captured into the style;
+    nodes pass transforms=False because those keys mean node-local
+    scaling/rotation there.
+    """
     leftovers = []
     for item in split_top_commas(opt):
         it = item.strip()
         low = it.lower()
+        if transforms:
+            m = re.fullmatch(
+                rf"shift\s*=\s*\{{\(\s*({NUM})\s*,\s*({NUM})\s*\)\}}", it)
+            if m:
+                style.tf_x += float(m.group(1))
+                style.tf_y += float(m.group(2))
+                continue
+            m = re.fullmatch(rf"xshift\s*=\s*({NUM})\s*(cm|mm|pt|in)?", it)
+            if m:
+                d = dim_to_cm(it.split("=", 1)[1])
+                if d is not None:
+                    style.tf_x += d
+                    continue
+            m = re.fullmatch(rf"yshift\s*=\s*({NUM})\s*(cm|mm|pt|in)?", it)
+            if m:
+                d = dim_to_cm(it.split("=", 1)[1])
+                if d is not None:
+                    style.tf_y += d
+                    continue
+            m = re.fullmatch(rf"rotate\s*=\s*({NUM})", it)
+            if m:
+                style.tf_rot += float(m.group(1))
+                continue
+            m = re.fullmatch(rf"scale\s*=\s*({NUM})", it)
+            if m:
+                style.tf_sx *= float(m.group(1))
+                style.tf_sy *= float(m.group(1))
+                continue
+            m = re.fullmatch(rf"xscale\s*=\s*({NUM})", it)
+            if m:
+                style.tf_sx *= float(m.group(1))
+                continue
+            m = re.fullmatch(rf"yscale\s*=\s*({NUM})", it)
+            if m:
+                style.tf_sy *= float(m.group(1))
+                continue
         if it != "-" and re.fullmatch(
                 r"(<|Stealth|Latex|stealth|latex)?-"
                 r"(>|Stealth|Latex|stealth|latex)?", it):
@@ -309,8 +352,8 @@ def _parse_scope(s: str) -> Optional[Element]:
         r"(?P<body>.*)\\end\{scope\}\s*", s, re.S)
     if not m:
         return None
-    x = y = 0.0
-    sc = 1.0
+    x = y = rot = 0.0
+    sc = xs = ys = 1.0
     for it in split_top_commas(m.group("opt") or ""):
         it = it.strip()
         if not it:
@@ -320,12 +363,34 @@ def _parse_scope(s: str) -> Optional[Element]:
         if mm:
             x, y = float(mm.group(1)), float(mm.group(2))
             continue
+        mm = re.fullmatch(rf"(x|y)?shift\s*=\s*({NUM})\s*(cm|mm|pt|in)?", it)
+        if mm:
+            d = dim_to_cm(it.split("=", 1)[1])
+            if d is not None:
+                if it.startswith("x"):
+                    x += d
+                else:
+                    y += d
+                continue
+        mm = re.fullmatch(rf"rotate\s*=\s*({NUM})", it)
+        if mm:
+            rot = float(mm.group(1))
+            continue
         mm = re.fullmatch(rf"scale\s*=\s*({NUM})", it)
         if mm:
             sc = float(mm.group(1))
             continue
+        mm = re.fullmatch(rf"xscale\s*=\s*({NUM})", it)
+        if mm:
+            xs = float(mm.group(1))
+            continue
+        mm = re.fullmatch(rf"yscale\s*=\s*({NUM})", it)
+        if mm:
+            ys = float(mm.group(1))
+            continue
         return None            # unknown scope option -> keep raw
-    return GroupEl(children=parse_body(m.group("body")), x=x, y=y, s=sc)
+    return GroupEl(children=parse_body(m.group("body")), x=x, y=y, s=sc,
+                   rot=rot, xs=xs, ys=ys)
 
 
 def _parse_node(s: str) -> Optional[Element]:
@@ -373,7 +438,7 @@ def _parse_node(s: str) -> Optional[Element]:
         return img
 
     style = Style()
-    leftovers = parse_options(opt, style)
+    leftovers = parse_options(opt, style, transforms=False)
     node = NodeEl(style=style, x=x, y=y, text=content)
     POSITIONAL = {"above": "south", "below": "north", "left": "east",
                   "right": "west",
