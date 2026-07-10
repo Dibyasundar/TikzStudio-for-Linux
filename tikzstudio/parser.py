@@ -10,7 +10,8 @@ from typing import List, Optional, Tuple
 
 from .elements import (Style, Element, LineEl, RectEl, CircleEl, EllipseEl,
                        PolyEl, BezierEl, PlotEl, ArcEl, GridEl, NodeEl,
-                       ImageEl, RawEl, LibraryEl, GroupEl, Figure, TikzDocument)
+                       ImageEl, RawEl, LibraryEl, GroupEl, CurveEl, PgfEl,
+                       Figure, TikzDocument)
 
 NUM = r"[-+]?\d*\.?\d+"
 PT = rf"\(\s*({NUM})\s*,\s*({NUM})\s*\)"
@@ -30,6 +31,16 @@ def split_statements(body: str) -> List[str]:
     stmts, cur, depth = [], "", 0
     i, n = 0, len(body)
     while i < n:
+        if body.startswith("\\pgf", i) and not cur.strip():
+            j = body.find("\n", i)
+            e = body.find(";", i)
+            if e != -1 and (j == -1 or e < j):
+                j = e + 1
+            elif j == -1:
+                j = n
+            stmts.append(body[i:j].rstrip(";").strip())
+            i = j
+            continue
         if body.startswith("\\begin{scope}", i) and not cur.strip():
             j = body.find("\\end{scope}", i)
             if j != -1:
@@ -252,6 +263,8 @@ def _parse_statement(stmt: str) -> Optional[Element]:
                                  x=xy[0], y=xy[1])
         return RawEl(code=s)      # marker but unmatched -> keep verbatim
 
+    if s.startswith("\\pgf"):
+        return PgfEl(code=s, effect=parse_pgf(s))
     if s.startswith("\\begin{scope}"):
         return _parse_scope(s)
     if s.startswith("\\node"):
@@ -318,13 +331,20 @@ def _parse_statement(stmt: str) -> Optional[Element]:
         a.cy = sy - r * math.sin(math.radians(a1))
         return a
 
-    # bezier ------------------------------------------------------------------
-    m = re.fullmatch(
-        rf"{PT}\s*\.\.\s*controls\s*{PT}\s*and\s*{PT}\s*\.\.\s*{PT}", rest)
+    # bezier (single segment or chained N-point curve) -------------------------
+    SEG = rf"\s*\.\.\s*controls\s*{PT}\s*and\s*{PT}\s*\.\.\s*{PT}"
+    m = re.fullmatch(rf"{PT}(?:{SEG})+", rest)
     if m:
-        b = BezierEl(style=style)
-        (b.x1, b.y1, b.c1x, b.c1y, b.c2x, b.c2y, b.x2, b.y2) = map(float, m.groups())
-        return b
+        nums = [float(a) for pair in re.findall(PT, rest) for a in pair]
+        start = nums[:2]
+        rest_nums = nums[2:]
+        segs = [rest_nums[k:k + 6] for k in range(0, len(rest_nums), 6)]
+        if len(segs) == 1:
+            b = BezierEl(style=style)
+            (b.x1, b.y1) = start
+            (b.c1x, b.c1y, b.c2x, b.c2y, b.x2, b.y2) = segs[0]
+            return b
+        return CurveEl(style=style, x0=start[0], y0=start[1], segs=segs)
 
     # plot / freehand ---------------------------------------------------------
     m = re.fullmatch(r"plot\s*\[\s*smooth\s*\]\s*coordinates\s*\{(.*)\}", rest, re.S)
@@ -344,6 +364,142 @@ def _parse_statement(stmt: str) -> Optional[Element]:
         return PolyEl(style=style, points=pts, closed=closed)
 
     return None
+
+
+PT_TO_CM = 0.035146
+
+
+def _dim_pt(txt):
+    d = dim_to_cm(txt)
+    return None if d is None else d / PT_TO_CM
+
+
+def _dash_list(txt):
+    return [_dim_pt(m) for m in re.findall(r"\{([^{}]*)\}", txt)]
+
+
+def parse_pgf(stmt: str) -> dict:
+    """Parse a \\pgfset... / \\pgftransform... command into an effect."""
+    s = stmt.strip().rstrip(";")
+    eff = {}
+
+    def m1(pat):
+        m = re.fullmatch(pat, s)
+        return m.groups() if m else None
+
+    g = m1(r"\\pgfsetlinewidth\{([^{}]*)\}")
+    if g:
+        v = _dim_pt(g[0])
+        if v is not None:
+            eff["lw"] = v
+        return eff
+    g = m1(r"\\pgfsetinnerlinewidth\{([^{}]*)\}")
+    if g:
+        v = _dim_pt(g[0])
+        if v is not None:
+            eff["inner_lw"] = v
+        return eff
+    g = m1(r"\\pgfsetdash\{(.*)\}\{([^{}]*)\}")
+    if g:
+        eff["dash"] = _dash_list(g[0])
+        eff["dash_phase"] = _dim_pt(g[1]) or 0.0
+        return eff
+    g = m1(r"\\pgfsetinnerdash\{(.*)\}\{([^{}]*)\}")
+    if g:
+        eff["inner_dash"] = _dash_list(g[0])
+        return eff
+    if s == "\\pgfsetbuttcap":
+        return {"cap": "butt"}
+    if s == "\\pgfsetroundcap":
+        return {"cap": "round"}
+    if s == "\\pgfsetrectcap":
+        return {"cap": "rect"}
+    if s == "\\pgfsetmiterjoin":
+        return {"join": "miter"}
+    if s == "\\pgfsetroundjoin":
+        return {"join": "round"}
+    if s == "\\pgfsetbeveljoin":
+        return {"join": "bevel"}
+    g = m1(r"\\pgfsetmiterlimit\{([^{}]*)\}")
+    if g:
+        try:
+            return {"miterlimit": float(g[0])}
+        except ValueError:
+            return eff
+    g = m1(r"\\pgfsetcolor\{(.*)\}")
+    if g:
+        return {"stroke": g[0], "fillc": g[0]}
+    g = m1(r"\\pgfsetstrokecolor\{(.*)\}")
+    if g:
+        return {"stroke": g[0]}
+    g = m1(r"\\pgfsetfillcolor\{(.*)\}")
+    if g:
+        return {"fillc": g[0]}
+    g = m1(r"\\pgfsetstrokeopacity\{([^{}]*)\}")
+    if g:
+        try:
+            return {"stroke_op": float(g[0])}
+        except ValueError:
+            return eff
+    g = m1(r"\\pgfsetfillopacity\{([^{}]*)\}")
+    if g:
+        try:
+            return {"fill_op": float(g[0])}
+        except ValueError:
+            return eff
+    g = m1(r"\\pgfsetblendmode\{([^{}]*)\}")
+    if g:
+        return {"blend": g[0].strip().lower()}
+    if s == "\\pgfsetnonzerorule":
+        return {"eo": False}
+    if s == "\\pgfseteorule":
+        return {"eo": True}
+    g = m1(r"\\pgfsetarrowsstart\{(.*)\}")
+    if g:
+        return {"astart": g[0].strip()}
+    g = m1(r"\\pgfsetarrowsend\{(.*)\}")
+    if g:
+        return {"aend": g[0].strip()}
+    g = m1(r"\\pgfsetshortenstart\{([^{}]*)\}")
+    if g:
+        d = dim_to_cm(g[0])
+        return {"ss": d} if d is not None else eff
+    g = m1(r"\\pgfsetshortenend\{([^{}]*)\}")
+    if g:
+        d = dim_to_cm(g[0])
+        return {"se": d} if d is not None else eff
+    # transforms ---------------------------------------------------------
+    g = m1(r"\\pgftransformshift\{\\pgfpoint\{([^{}]*)\}\{([^{}]*)\}\}")
+    if g:
+        x, y = dim_to_cm(g[0]), dim_to_cm(g[1])
+        if x is not None and y is not None:
+            return {"tf": ("shift", x, y)}
+        return eff
+    g = m1(r"\\pgftransformscale\{([^{}]*)\}")
+    if g:
+        try:
+            f = float(g[0]); return {"tf": ("scale", f, f)}
+        except ValueError:
+            return eff
+    g = m1(r"\\pgftransformxscale\{([^{}]*)\}")
+    if g:
+        try:
+            return {"tf": ("scale", float(g[0]), 1.0)}
+        except ValueError:
+            return eff
+    g = m1(r"\\pgftransformyscale\{([^{}]*)\}")
+    if g:
+        try:
+            return {"tf": ("scale", 1.0, float(g[0]))}
+        except ValueError:
+            return eff
+    g = m1(r"\\pgftransformrotate\{([^{}]*)\}")
+    if g:
+        try:
+            return {"tf": ("rotate", float(g[0]))}
+        except ValueError:
+            return eff
+    return eff
 
 
 def _parse_scope(s: str) -> Optional[Element]:

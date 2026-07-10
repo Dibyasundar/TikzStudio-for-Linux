@@ -56,6 +56,10 @@ CATALOG = [
     ("pentagon",           ["shapes.geometric"], _node("regular polygon", "regular polygon sides=5")),
     ("hexagon",            ["shapes.geometric"], _node("regular polygon", "regular polygon sides=6")),
     ("star node",          ["shapes.geometric"], _node("star", "star points=5")),
+    ("star 6",             ["shapes.geometric"], _node("star", "star points=6")),
+    ("star path",          [],
+     "\\draw[shift={(@X@,@Y@)}] (90:0.5) \\foreach \\i in {1,...,5} "
+     "{ -- (90+\\i*36+18:0.22) -- (90+\\i*72:0.5) } -- cycle;"),
     # -- symbols ------------------------------------------------------------
     ("cloud",              ["shapes.symbols"],   _node("cloud", "aspect=2")),
     ("starburst",          ["shapes.symbols"],   _node("starburst")),

@@ -40,8 +40,8 @@ TOOL_LABELS = {
     "circle": ("◯", "Circle (C) — drag from centre"),
     "ellipse": ("⬭", "Ellipse (E) — drag"),
     "polygon": ("⬠", "Polygon (P) — click vertices, double-click to close"),
-    "star": ("★", "Star — drag from centre"),
-    "bezier": ("∿", "Bézier curve (B) — drag, then tweak control points in code"),
+    "bezier": ("∿", "Bézier curve (B) — click any number of anchor points, "
+               "double-click to finish"),
     "freehand": ("✎", "Freehand (F) — draw"),
     "arc": ("◜", "Arc — drag from centre; edit angles in Properties"),
     "grid": ("▦", "Grid — drag area"),
@@ -468,11 +468,6 @@ class MainWindow(QMainWindow):
             lambda _: self._apply_text_format())
         _row("tsize", "Text size", self.p_tsize)
 
-        self.p_star_n = QSpinBox(); self.p_star_n.setRange(3, 12); self.p_star_n.setValue(5)
-        self.p_star_n.valueChanged.connect(
-            lambda v: setattr(self.canvas, "star_points", v))
-        _row("star", "Star points", self.p_star_n)
-
         # contextual (selection) fields
         self.p_a1 = QDoubleSpinBox(); self.p_a1.setRange(-360, 360)
         self.p_a2 = QDoubleSpinBox(); self.p_a2.setRange(-360, 360)
@@ -739,7 +734,8 @@ class MainWindow(QMainWindow):
                                ImageEl, LibraryEl, GroupEl)
         base = {"stroke", "lw", "dash", "op"}
         closed = base | {"fill", "fop"}
-        if isinstance(e, (LineEl, BezierEl)):
+        from .elements import CurveEl as _CurveEl
+        if isinstance(e, (LineEl, BezierEl, _CurveEl)):
             return base | {"arrow"}
         if isinstance(e, PlotEl):
             return base | {"arrow"}
@@ -834,7 +830,7 @@ class MainWindow(QMainWindow):
         # visible = intersection of every selected element's valid fields
         if not sel:
             keys = {"stroke", "fill", "lw", "dash", "arrow",
-                    "op", "fop", "star"}
+                    "op", "fop"}
         else:
             keys = self._element_prop_keys(sel[0])
             for e in sel[1:]:
@@ -1145,8 +1141,11 @@ class MainWindow(QMainWindow):
         return w
 
     def _init_library(self):
-        if REGISTRY.load() and any(not s.custom
-                                   for s in REGISTRY.shapes.values()):
+        loaded = REGISTRY.load() and any(not s.custom
+                                         for s in REGISTRY.shapes.values())
+        missing = [n for n, _, _ in libmod.CATALOG
+                   if REGISTRY.get(n) is None]
+        if loaded and not missing:
             self._fill_palette()
         else:
             self._start_library_build()

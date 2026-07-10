@@ -1,5 +1,7 @@
 **This project aims to develop a native Linux interface inspired by TikZedit. Please note that the majority of the codebase was generated using Claude's Fabel AI model. The software is currently under active development and is provided "as is," so please use it at your own discretion. We anticipate rolling out new version releases in the near future.**
 
+
+
 # TikZ Studio
 
 A WYSIWYG desktop editor for TikZ/LaTeX diagrams on Linux, with **live
@@ -8,7 +10,7 @@ two-way synchronization** between a visual canvas and the TikZ source code.
 ## Install (Debian/Ubuntu)
 
 ```bash
-sudo apt install ./tikzstudio_1.3.0_all.deb
+sudo apt install ./tikzstudio_1.6.0_all.deb
 ```
 
 This pulls in the dependencies automatically: `python3-pyqt6`,
@@ -40,6 +42,40 @@ Launch from the application menu (**TikZ Studio**) or run `tikzstudio`.
   appears in the palette permanently (marked ★).
 
 **Visual canvas (left/center)**
+- **Whole-element multi-select**: the rubber band selects only elements
+  fully inside it (no accidental partial grabs); the Properties panel
+  bulk-edits everything selected.
+- **N-point Bézier curves**: the Bézier tool is click-based — click any
+  number of anchor points, double-click to finish a smooth
+  Catmull-Rom curve emitted as chained `.. controls ..` segments; every
+  anchor and control point stays draggable with guide lines.
+- **PGF layer rendering**: raw `\pgfset…`/`\pgftransform…` commands in
+  the code (no semicolon needed) act as a running graphics state that
+  the canvas honours on subsequent paths — line width, dash pattern &
+  phase, inner line width/dash (double lines), butt/round/rect caps,
+  miter/round/bevel joins + miter limit, stroke/fill colour &
+  opacities, blend modes, even-odd vs nonzero fill rule, arrow
+  start/end tips, shorten start/end, and shift/scale/x-yscale/rotate
+  transforms. Commands are preserved verbatim in the code.
+- The star tool moved from the toolbar into the element collection
+  (Geometric group: *star node*, *star 6*, *star path*); the palette
+  rebuilds automatically when new built-ins appear.
+- **Text formatting** for the selected node in the Properties dock:
+  Bold / Italic / Underline toggles, a text-colour picker
+  (`\textcolor`) and a size combo (`\tiny` … `\Huge`) — wrapped as
+  proper LaTeX and rendered on the canvas.
+- **Auto-select after drawing**: finishing any shape switches back to
+  the Select tool with the fresh element already selected.
+- **Icon toolbar** with tooltips; the Arrow button is a dropdown
+  (straight / multipoint) and ⧉ / ⧈ buttons group and ungroup scopes.
+- **Full scope & path transforms**: scopes support `shift`, `rotate`,
+  `scale`, `xscale`, `yscale`, `xshift`, `yshift` (negative scales
+  mirror) with Group rotate/xscale/yscale spinners in Properties — and
+  the same transform options on *any* element (`\draw[xscale=2,
+  rotate=15] …`) render correctly on the canvas.
+- **Jump code ⇄ element**: right-click an element → *Show in code*
+  highlights its statement; right-click a code line → *Show element on
+  canvas* selects and centres it.
 - **Faithful option rendering**: node options (`anchor=`, `scale=`,
   `rotate=`, `minimum width/height/size=`, `text width=` with wrapping,
   `align=`, positional `above`/`below left`/…) all affect the canvas;
@@ -84,11 +120,31 @@ Launch from the application menu (**TikZ Studio**) or run `tikzstudio`.
   images (`\includegraphics`) — required TikZ libraries/packages are added
   to the preamble automatically.
 
+**Workspace**
+- **Accordion side panels**: left panel stacks Properties / Elements /
+  Files, right panel stacks TikZ code / PDF preview — with slim margin
+  arrows on both window edges to hide or show each side entirely.
+- **File explorer**: the Files section browses the current working
+  folder; double-click opens `.tex`/`.tikz` files or inserts images.
+  The active file's full path is always shown above the canvas.
+- **PDF preview zoom**: − / ＋ / 1:1 controls with a live percentage.
+- **Smart Properties panel**: only the fields valid for the current
+  selection are shown; with a multi-selection it shows the fields all
+  selected elements share and edits apply to **all of them at once**
+  (bulk edit).
+- **Element groups**: palette elements are organised into groups
+  (Geometric, Symbols, Callouts, Arrows, Paths, Flowchart, Misc) with a
+  filter dropdown; custom elements go into user-named groups —
+  right-click a custom element to change its group or delete it.
+
 **Code editor (right dock)**
 - **Two editing modes**: *Current figure body* (default, syncs with the
   canvas) or *Whole document* — full .tex file editing including the
   preamble, packages and every figure, still live-synced back into the
   app. Opens `.tex`, `.tikz`, `.pgf` and bare TikZ body files.
+- **Search & replace** with Ctrl+H (find next / replace / replace all,
+  match-case), also in the right-click menu; legacy `{\bf …}`,
+  `{\it …}`, `{\em …}` switches are understood and rendered.
 - **Comment / uncomment** the selected lines with Ctrl+T / Ctrl+R;
   **find** with Ctrl+F (F3 next, Shift+F3 previous); **undo/redo** with
   Ctrl+Z / Ctrl+Shift+Z (works in the editor *and* on canvas edits —

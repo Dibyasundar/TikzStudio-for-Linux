@@ -480,6 +480,81 @@ class LibraryEl(Element):
 
 
 @dataclass
+class CurveEl(Element):
+    """Continuous multi-segment Bézier: start point + N cubic segments.
+
+    Each segment is [c1x, c1y, c2x, c2y, px, py]; emitted as a chained
+    `.. controls .. and .. ..` path so any number of anchor points works.
+    """
+    x0: float = 0; y0: float = 0
+    segs: List[List[float]] = field(default_factory=list)
+
+    def to_tikz(self):
+        parts = [f"({fnum(self.x0)},{fnum(self.y0)})"]
+        for c1x, c1y, c2x, c2y, px, py in self.segs:
+            parts.append(f".. controls ({fnum(c1x)},{fnum(c1y)}) and"
+                         f" ({fnum(c2x)},{fnum(c2y)}) .."
+                         f" ({fnum(px)},{fnum(py)})")
+        return f"\\draw{self.style.options()} " + " ".join(parts) + ";"
+
+    def handles(self):
+        h = [(self.x0, self.y0)]
+        for sg in self.segs:
+            h += [(sg[0], sg[1]), (sg[2], sg[3]), (sg[4], sg[5])]
+        return h
+
+    def move_handle(self, i, x, y):
+        if i == 0:
+            self.x0, self.y0 = x, y
+            return
+        sg = self.segs[(i - 1) // 3]
+        k = ((i - 1) % 3) * 2
+        sg[k], sg[k + 1] = x, y
+
+    def translate(self, dx, dy):
+        self.x0 += dx; self.y0 += dy
+        for sg in self.segs:
+            for k in range(0, 6, 2):
+                sg[k] += dx; sg[k + 1] += dy
+
+    def bake(self, s, dx, dy):
+        self.x0 = dx + s * self.x0; self.y0 = dy + s * self.y0
+        for sg in self.segs:
+            for k in range(0, 6, 2):
+                sg[k] = dx + s * sg[k]; sg[k + 1] = dy + s * sg[k + 1]
+        return True
+
+
+def catmull_to_curve(pts, style=None):
+    """Smooth CurveEl through the given anchor points (Catmull-Rom)."""
+    ext = [pts[0]] + list(pts) + [pts[-1]]
+    segs = []
+    for i in range(1, len(pts)):
+        p0, p1, p2, p3 = ext[i - 1], ext[i], ext[i + 1], ext[i + 2]
+        c1 = (p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6)
+        c2 = (p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6)
+        segs.append([round(c1[0], 3), round(c1[1], 3),
+                     round(c2[0], 3), round(c2[1], 3),
+                     pts[i][0], pts[i][1]])
+    return CurveEl(style=style or Style(), x0=pts[0][0], y0=pts[0][1],
+                   segs=segs)
+
+
+@dataclass
+class PgfEl(Element):
+    """A raw PGF layer command (\\pgfset..., \\pgftransform...).
+
+    Preserved verbatim in the code; on the canvas it is invisible but its
+    parsed `effect` modifies the graphics state of the elements after it.
+    """
+    code: str = ""
+    effect: dict = field(default_factory=dict)
+
+    def to_tikz(self):
+        return self.code
+
+
+@dataclass
 class GroupEl(Element):
     """A \\begin{scope} grouping several elements; can be moved (shift)
     and scaled (scale) as one.  TikZ applies the options in order, so

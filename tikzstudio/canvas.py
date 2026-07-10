@@ -14,12 +14,14 @@ from PyQt6.QtWidgets import (QGraphicsView, QGraphicsScene, QGraphicsItem,
 
 from .mathtext import latex_to_unicode
 from .textformat import parse_format, SIZE_PTS
+import dataclasses
 from .elements import (SCALE, Style, Element, LineEl, RectEl, CircleEl,
                        EllipseEl, PolyEl, BezierEl, PlotEl, ArcEl, GridEl,
-                       NodeEl, ImageEl, RawEl, LibraryEl, GroupEl, Figure)
+                       NodeEl, ImageEl, RawEl, LibraryEl, GroupEl, CurveEl,
+                       PgfEl, Figure, catmull_to_curve)
 
 TOOLS = ["select", "line", "arrow", "rect", "circle", "ellipse", "polygon",
-         "star", "bezier", "freehand", "arc", "grid", "node", "image"]
+         "bezier", "freehand", "arc", "grid", "node", "image"]
 
 
 # ----------------------------------------------------------------------
@@ -81,6 +83,84 @@ def to_scene(x: float, y: float) -> QPointF:
 
 def from_scene(p: QPointF):
     return p.x() / SCALE, -p.y() / SCALE
+
+
+PT_PX = SCALE * 0.035146      # pixels per (TeX) point
+
+BLEND_MODES = {
+    "multiply": QPainter.CompositionMode.CompositionMode_Multiply,
+    "screen": QPainter.CompositionMode.CompositionMode_Screen,
+    "overlay": QPainter.CompositionMode.CompositionMode_Overlay,
+    "darken": QPainter.CompositionMode.CompositionMode_Darken,
+    "lighten": QPainter.CompositionMode.CompositionMode_Lighten,
+    "difference": QPainter.CompositionMode.CompositionMode_Difference,
+    "exclusion": QPainter.CompositionMode.CompositionMode_Exclusion,
+    "hard light": QPainter.CompositionMode.CompositionMode_HardLight,
+    "soft light": QPainter.CompositionMode.CompositionMode_SoftLight,
+}
+
+
+class PgfState:
+    r"""Running graphics state built from \pgfset.../\pgftransform...
+    commands; applied as defaults to the elements that follow them."""
+
+    def __init__(self):
+        self.lw = None            # pt
+        self.dash = None          # list of pt
+        self.inner_lw = 0.0
+        self.inner_dash = None
+        self.cap = None
+        self.join = None
+        self.miterlimit = None
+        self.stroke = None
+        self.fillc = None
+        self.stroke_op = None
+        self.fill_op = None
+        self.blend = None
+        self.eo = False
+        self.astart = ""
+        self.aend = ""
+        self.ss = 0.0
+        self.se = 0.0
+        self.qt = QTransform()
+
+    def copy(self):
+        c = PgfState()
+        c.__dict__.update(self.__dict__)
+        c.dash = list(self.dash) if self.dash else None
+        c.inner_dash = list(self.inner_dash) if self.inner_dash else None
+        c.qt = QTransform(self.qt)
+        return c
+
+    def identity(self):
+        return all(v in (None, 0.0, "", False) for k, v in
+                   self.__dict__.items() if k != "qt") and self.qt.isIdentity()
+
+    def apply(self, eff: dict):
+        for k, v in eff.items():
+            if k == "tf":
+                t = QTransform()
+                if v[0] == "shift":
+                    t.translate(v[1] * SCALE, -v[2] * SCALE)
+                elif v[0] == "scale":
+                    t.scale(v[1], v[2])
+                elif v[0] == "rotate":
+                    t.rotate(-v[1])
+                # PGF concatenates: new transform acts first on coords
+                self.qt = t * self.qt
+            else:
+                setattr(self, k, v)
+
+
+def _pgf_tip(token: str, end: bool) -> str:
+    t = token.lower()
+    if "stealth" in t:
+        return "Stealth"
+    if "latex" in t:
+        return "Latex"
+    if t in ("to", "to reversed") or ">" in t or t == "v":
+        return ">" if end else "<"
+    return ">" if end else "<"
 
 
 # ----------------------------------------------------------------------
@@ -154,6 +234,11 @@ def arrow_heads(e: Element) -> List[Tuple[QPainterPath, bool]]:
     elif isinstance(e, BezierEl):
         add(end_k, (e.x2, e.y2), (e.x2 - e.c2x, e.y2 - e.c2y))
         add(start_k, (e.x1, e.y1), (e.x1 - e.c1x, e.y1 - e.c1y))
+    elif isinstance(e, CurveEl) and e.segs:
+        last = e.segs[-1]
+        add(end_k, (last[4], last[5]), (last[4] - last[2], last[5] - last[3]))
+        first = e.segs[0]
+        add(start_k, (e.x0, e.y0), (e.x0 - first[0], e.y0 - first[1]))
     elif isinstance(e, ArcEl):
         sgn = 1.0 if e.a2 >= e.a1 else -1.0
         for kind, a, s in ((end_k, e.a2, sgn), (start_k, e.a1, -sgn)):
@@ -215,6 +300,11 @@ def element_path(e: Element, canvas: "Canvas") -> QPainterPath:
         path.moveTo(to_scene(e.x1, e.y1))
         path.cubicTo(to_scene(e.c1x, e.c1y), to_scene(e.c2x, e.c2y),
                      to_scene(e.x2, e.y2))
+    elif isinstance(e, CurveEl) and e.segs:
+        path.moveTo(to_scene(e.x0, e.y0))
+        for c1x, c1y, c2x, c2y, px, py in e.segs:
+            path.cubicTo(to_scene(c1x, c1y), to_scene(c2x, c2y),
+                         to_scene(px, py))
     elif isinstance(e, PlotEl) and e.points:
         path.moveTo(to_scene(*e.points[0]))
         for p in e.points[1:]:
@@ -373,10 +463,11 @@ def image_transform(e: ImageEl) -> QTransform:
 # Graphics item wrapping one Element
 # ----------------------------------------------------------------------
 class ElementItem(QGraphicsPathItem):
-    def __init__(self, element: Element, canvas: "Canvas"):
+    def __init__(self, element: Element, canvas: "Canvas", pgf=None):
         super().__init__()
         self.element = element
         self.canvas = canvas
+        self.pgf = pgf
         self._heads: List[Tuple[QPainterPath, bool]] = []
         self._handles: List[HandleItem] = []
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
@@ -389,27 +480,100 @@ class ElementItem(QGraphicsPathItem):
     def rebuild(self):
         e = self.element
         st = e.style
-        pen = QPen(qcolor_alpha(st.draw or "black", st.draw_opacity))
-        pen.setWidthF(max(st.line_width * 1.6, 1.0))
+        pgf = self.pgf
+        # --- merge the running PGF graphics state as defaults ----------
+        lw_pt = st.line_width
+        if pgf and pgf.lw is not None and abs(st.line_width - 0.4) < 1e-9:
+            lw_pt = pgf.lw
+        stroke = st.draw or "black"
+        if pgf and pgf.stroke and st.draw in ("", "black"):
+            stroke = pgf.stroke
+        d_op = st.draw_opacity
+        if pgf and pgf.stroke_op is not None and st.draw_opacity >= 0.999:
+            d_op = pgf.stroke_op
+        pen = QPen(qcolor_alpha(stroke, d_op))
+        pen.setWidthF(max(lw_pt * 1.6, 1.0))
         if st.dash == "dashed":
             pen.setStyle(Qt.PenStyle.DashLine)
         elif st.dash == "dotted":
             pen.setStyle(Qt.PenStyle.DotLine)
+        elif pgf and pgf.dash:
+            pw = max(lw_pt * 1.6, 1.0)
+            pat = [max(d * PT_PX / pw, 0.1) for d in pgf.dash]
+            if len(pat) % 2:
+                pat = pat * 2
+            if pat:
+                pen.setDashPattern(pat)
+                if pgf.dash_phase:
+                    pen.setDashOffset(pgf.dash_phase * PT_PX / pw)
+        if pgf:
+            if pgf.cap == "round":
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            elif pgf.cap == "rect":
+                pen.setCapStyle(Qt.PenCapStyle.SquareCap)
+            elif pgf.cap == "butt":
+                pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+            if pgf.join == "round":
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            elif pgf.join == "bevel":
+                pen.setJoinStyle(Qt.PenJoinStyle.BevelJoin)
+            elif pgf.join == "miter":
+                pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+            if pgf.miterlimit is not None:
+                pen.setMiterLimit(pgf.miterlimit)
         self.setPen(pen)
-        self.setBrush(QBrush(qcolor_alpha(st.fill, st.fill_opacity))
-                      if st.fill else QBrush(Qt.BrushStyle.NoBrush))
+        f_op = st.fill_opacity
+        if pgf and pgf.fill_op is not None and st.fill_opacity >= 0.999:
+            f_op = pgf.fill_op
+        fill = st.fill
+        if pgf and pgf.fillc and st.fill:      # explicit fill recoloured
+            if st.fill == "black":
+                fill = pgf.fillc
+        self.setBrush(QBrush(qcolor_alpha(fill, f_op))
+                      if fill else QBrush(Qt.BrushStyle.NoBrush))
         self.setOpacity(st.opacity)
-        self.setPath(element_path(e, self.canvas))
-        self._heads = arrow_heads(e)
+
+        e_draw = e
+        # pgf shorten: trim drawn line endpoints (model untouched)
+        if pgf and isinstance(e, LineEl) and (pgf.ss or pgf.se):
+            dx, dy = e.x2 - e.x1, e.y2 - e.y1
+            L = math.hypot(dx, dy) or 1.0
+            ux, uy = dx / L, dy / L
+            e_draw = dataclasses.replace(
+                e, x1=e.x1 + ux * pgf.ss, y1=e.y1 + uy * pgf.ss,
+                x2=e.x2 - ux * pgf.se, y2=e.y2 - uy * pgf.se)
+        # pgf arrows apply when the element sets none
+        if pgf and not st.arrows and (pgf.astart or pgf.aend):
+            arr = ((_pgf_tip(pgf.astart, False) if pgf.astart else "")
+                   + "-" + (_pgf_tip(pgf.aend, True) if pgf.aend else ""))
+            st2 = st.copy(); st2.arrows = arr
+            e_draw = dataclasses.replace(e_draw, style=st2)
+
+        path = element_path(e_draw, self.canvas)
+        if pgf and pgf.eo:
+            path.setFillRule(Qt.FillRule.OddEvenFill)
+        self.setPath(path)
+        self._heads = arrow_heads(e_draw)
+        self._inner_pen = None
+        if pgf and pgf.inner_lw > 0:
+            ip = QPen(QColor("white"))
+            ip.setWidthF(max(pgf.inner_lw * 1.6, 0.6))
+            if pgf.inner_dash:
+                pw = max(pgf.inner_lw * 1.6, 0.6)
+                pat = [max(d * PT_PX / pw, 0.1) for d in pgf.inner_dash]
+                if len(pat) % 2:
+                    pat = pat * 2
+                ip.setDashPattern(pat)
+            self._inner_pen = ip
         # TikZ coordinate transforms ([shift, rotate, xscale, yscale, ...])
+        t = QTransform()
         if st.has_transform():
-            t = QTransform()
             t.translate(st.tf_x * SCALE, -st.tf_y * SCALE)
             t.rotate(-st.tf_rot)
             t.scale(st.tf_sx, st.tf_sy)
-            self.setTransform(t)
-        else:
-            self.setTransform(QTransform())
+        if pgf is not None and not pgf.qt.isIdentity():
+            t = t * pgf.qt          # element transform first, then PGF CTM
+        self.setTransform(t)
 
     # -- reshape handles --------------------------------------------------
     def show_handles(self):
@@ -470,6 +634,8 @@ class ElementItem(QGraphicsPathItem):
     def paint(self, painter: QPainter, option, widget=None):
         e = self.element
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self.pgf and self.pgf.blend in BLEND_MODES:
+            painter.setCompositionMode(BLEND_MODES[self.pgf.blend])
         if isinstance(e, NodeEl):
             painter.setOpacity(e.style.opacity)
             disp, font, rect, flags, tcolor = node_box(e)
@@ -517,6 +683,8 @@ class ElementItem(QGraphicsPathItem):
                 painter.drawText(r, Qt.AlignmentFlag.AlignCenter, e.name)
         else:
             super().paint(painter, option, widget)
+            if getattr(self, "_inner_pen", None) is not None:
+                painter.strokePath(self.path(), self._inner_pen)
             # distinct arrowheads per tip style
             col = qcolor(e.style.draw or "black")
             for hp, filled in self._heads:
@@ -532,6 +700,15 @@ class ElementItem(QGraphicsPathItem):
                                     Qt.PenStyle.DotLine))
                 painter.drawLine(to_scene(e.x1, e.y1), to_scene(e.c1x, e.c1y))
                 painter.drawLine(to_scene(e.x2, e.y2), to_scene(e.c2x, e.c2y))
+            if self.isSelected() and isinstance(e, CurveEl):
+                painter.setPen(QPen(QColor(30, 120, 255, 130), 1,
+                                    Qt.PenStyle.DotLine))
+                prev = (e.x0, e.y0)
+                for sg in e.segs:
+                    painter.drawLine(to_scene(*prev), to_scene(sg[0], sg[1]))
+                    painter.drawLine(to_scene(sg[4], sg[5]),
+                                     to_scene(sg[2], sg[3]))
+                    prev = (sg[4], sg[5])
         if self.isSelected():
             painter.setOpacity(1.0)
             painter.setPen(QPen(QColor(30, 120, 255), 1, Qt.PenStyle.DashLine))
@@ -591,7 +768,7 @@ class GroupItem(ElementItem):
         for child in e.children:
             if isinstance(child, RawEl):
                 continue
-            it = make_item(child, self.canvas)
+            it = make_item(child, self.canvas, self.pgf)
             it.setParentItem(self)
             it.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
             it.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
@@ -622,9 +799,9 @@ class GroupItem(ElementItem):
                              + QPointF(2, -3), "scope")
 
 
-def make_item(e: Element, canvas: "Canvas") -> ElementItem:
-    return GroupItem(e, canvas) if isinstance(e, GroupEl) \
-        else ElementItem(e, canvas)
+def make_item(e: Element, canvas: "Canvas", pgf=None) -> ElementItem:
+    return GroupItem(e, canvas, pgf) if isinstance(e, GroupEl) \
+        else ElementItem(e, canvas, pgf)
 
 
 # ----------------------------------------------------------------------
@@ -644,6 +821,9 @@ class Canvas(QGraphicsView):
         self.setScene(self._scene)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+        # multi-select picks WHOLE elements only (fully inside the band)
+        self.setRubberBandSelectionMode(
+            Qt.ItemSelectionMode.ContainsItemShape)
         self.setTransformationAnchor(
             QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.figure: Figure = Figure()
@@ -709,6 +889,9 @@ class Canvas(QGraphicsView):
             hint = "  (click vertices, double-click to close)"
         elif tool == "multiarrow":
             hint = "  (click waypoints, double-click to finish the arrow)"
+        elif tool == "bezier":
+            hint = ("  (click any number of anchor points, double-click "
+                    "to finish the smooth curve)")
         self.status.emit(f"Tool: {tool}{hint}")
         self.tool_changed.emit(tool)
 
@@ -721,9 +904,16 @@ class Canvas(QGraphicsView):
         self._handle_owner = None
         self._scene.clear()
         self._temp = None
+        state = PgfState()
         for el in self.figure.elements:
-            if not isinstance(el, RawEl):
-                self._scene.addItem(make_item(el, self))
+            if isinstance(el, PgfEl):
+                state.apply(el.effect)
+                continue
+            if isinstance(el, RawEl):
+                continue
+            self._scene.addItem(
+                make_item(el, self,
+                          None if state.identity() else state.copy()))
         self._scene.blockSignals(False)
         self.viewport().update()
         self.selection_changed.emit([])
@@ -844,7 +1034,7 @@ class Canvas(QGraphicsView):
                 self._add(ImageEl(x=x, y=y, path=self._relativize(path),
                                   width=3.0))
             return
-        if self.tool in ("polygon", "multiarrow"):
+        if self.tool in ("polygon", "multiarrow", "bezier"):
             self._poly_pts.append((x, y))
             self._preview_poly()
             return
@@ -862,7 +1052,8 @@ class Canvas(QGraphicsView):
 
     def mouseMoveEvent(self, ev):
         if self.tool == "select" or self._start is None:
-            if self.tool in ("polygon", "multiarrow") and self._poly_pts:
+            if self.tool in ("polygon", "multiarrow", "bezier") \
+                    and self._poly_pts:
                 self._preview_poly(self.mapToScene(ev.pos()))
             return super().mouseMoveEvent(ev)
         cur = self._snap_pt(self.mapToScene(ev.pos()))
@@ -877,7 +1068,8 @@ class Canvas(QGraphicsView):
     def mouseReleaseEvent(self, ev):
         if self.tool == "select":
             return super().mouseReleaseEvent(ev)
-        if self._start is None or self.tool in ("polygon", "multiarrow"):
+        if self._start is None or self.tool in ("polygon", "multiarrow",
+                                                 "bezier"):
             return super().mouseReleaseEvent(ev)
         end = self._snap_pt(self.mapToScene(ev.pos()))
         x1, y1 = from_scene(self._start); x2, y2 = from_scene(end)
@@ -916,12 +1108,7 @@ class Canvas(QGraphicsView):
         elif self.tool == "grid":
             st.draw = st.draw if st.draw != "black" else "gray!60"
             self._add(GridEl(style=st, x1=x1, y1=y1, x2=x2, y2=y2, step=0.5))
-        elif self.tool == "star":
-            self._add(self._make_star(x1, y1,
-                                      math.hypot(x2 - x1, y2 - y1), st))
-        elif self.tool == "bezier":
-            self._add(self._line_to_bezier(
-                LineEl(style=st, x1=x1, y1=y1, x2=x2, y2=y2)))
+
 
     def mouseDoubleClickEvent(self, ev):
         if self.tool == "polygon" and len(self._poly_pts) >= 3:
@@ -929,6 +1116,18 @@ class Canvas(QGraphicsView):
             self._add(PolyEl(style=self.default_style.copy(),
                              points=self._poly_pts[:], closed=True))
             self._poly_pts = []
+            return
+        if self.tool == "bezier" and len(self._poly_pts) >= 2:
+            self._kill_temp()
+            st = self.default_style.copy()
+            pts = self._poly_pts[:]
+            self._poly_pts = []
+            if len(pts) == 2:
+                self._add(self._line_to_bezier(
+                    LineEl(style=st, x1=pts[0][0], y1=pts[0][1],
+                           x2=pts[1][0], y2=pts[1][1])))
+            else:
+                self._add(catmull_to_curve(pts, st))
             return
         if self.tool == "multiarrow" and len(self._poly_pts) >= 2:
             self._kill_temp()
@@ -999,7 +1198,7 @@ class Canvas(QGraphicsView):
             p.moveTo(a); p.lineTo(b)
         elif self.tool in ("rect", "grid"):
             p.addRect(QRectF(a, b).normalized())
-        elif self.tool in ("circle", "arc", "star"):
+        elif self.tool in ("circle", "arc"):
             r = math.hypot(b.x() - a.x(), b.y() - a.y())
             p.addEllipse(a, r, r)
         elif self.tool == "ellipse":
@@ -1047,16 +1246,6 @@ class Canvas(QGraphicsView):
             if isinstance(it, ElementItem) and it.element is el:
                 it.setSelected(True)
                 break
-
-    def _make_star(self, cx, cy, r, st: Style) -> PolyEl:
-        n = self.star_points
-        pts = []
-        for i in range(2 * n):
-            rad = r if i % 2 == 0 else r * 0.45
-            ang = math.pi / 2 + i * math.pi / n
-            pts.append((round(cx + rad * math.cos(ang), 3),
-                        round(cy + rad * math.sin(ang), 3)))
-        return PolyEl(style=st, points=pts, closed=True)
 
     @staticmethod
     def _line_to_bezier(l: LineEl) -> BezierEl:

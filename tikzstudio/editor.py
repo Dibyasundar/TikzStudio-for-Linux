@@ -37,6 +37,19 @@ TIKZ_KEYWORDS = [
     "\\usetikzlibrary{}", "\\usepackage{}", "smooth", "tension=",
     "domain=", "samples=", "variable=", "loop above", "loop below",
     "bend left", "bend right", "out=", "in=", "pos=0.5", "sloped",
+    "\\pgfsetlinewidth{1pt}", "\\pgfsetdash{{3pt}{2pt}}{0pt}",
+    "\\pgfsetinnerlinewidth{0.4pt}", "\\pgfsetinnerdash{{2pt}{2pt}}{0pt}",
+    "\\pgfsetbuttcap", "\\pgfsetroundcap", "\\pgfsetrectcap",
+    "\\pgfsetmiterjoin", "\\pgfsetroundjoin", "\\pgfsetbeveljoin",
+    "\\pgfsetmiterlimit{10}", "\\pgfsetcolor{}", "\\pgfsetstrokecolor{}",
+    "\\pgfsetfillcolor{}", "\\pgfsetstrokeopacity{0.5}",
+    "\\pgfsetfillopacity{0.5}", "\\pgfsetblendmode{multiply}",
+    "\\pgfsetnonzerorule", "\\pgfseteorule",
+    "\\pgfsetarrowsstart{stealth}", "\\pgfsetarrowsend{stealth}",
+    "\\pgfsetshortenstart{2pt}", "\\pgfsetshortenend{2pt}",
+    "\\pgftransformshift{\\pgfpoint{1cm}{0cm}}",
+    "\\pgftransformscale{2}", "\\pgftransformxscale{2}",
+    "\\pgftransformyscale{2}", "\\pgftransformrotate{45}",
 ]
 
 
