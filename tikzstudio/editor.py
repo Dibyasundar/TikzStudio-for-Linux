@@ -111,6 +111,8 @@ class TikzEditor(QPlainTextEdit):
             act = menu.addAction("⇠ Show element on canvas")
             act.triggered.connect(lambda: self.jump_handler(line))
             menu.addSeparator()
+            fr = menu.addAction("Find / Replace…\tCtrl+H")
+            fr.triggered.connect(self._replace_dialog)
             c = menu.addAction("Comment lines\tCtrl+T")
             c.triggered.connect(lambda: self._comment_selection(True))
             u = menu.addAction("Uncomment lines\tCtrl+R")
@@ -150,6 +152,9 @@ class TikzEditor(QPlainTextEdit):
             return
         if ctrl and ev.key() == Qt.Key.Key_F:        # find
             self._find_dialog()
+            return
+        if ctrl and ev.key() == Qt.Key.Key_H:        # search & replace
+            self._replace_dialog()
             return
         if ev.key() == Qt.Key.Key_F3:                # find next / previous
             self._find_next(backwards=bool(
@@ -200,6 +205,90 @@ class TikzEditor(QPlainTextEdit):
                 break
             block = block.next()
         tc.endEditBlock()
+
+    # -- search & replace (Ctrl+H) --------------------------------------------
+    def _replace_dialog(self):
+        from PyQt6.QtWidgets import (QDialog, QFormLayout, QLineEdit,
+                                     QHBoxLayout, QPushButton, QVBoxLayout,
+                                     QLabel, QCheckBox)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Find && Replace")
+        lay = QVBoxLayout(dlg)
+        form = QFormLayout()
+        find_e = QLineEdit(getattr(self, "_find_q", ""))
+        repl_e = QLineEdit(getattr(self, "_repl_q", ""))
+        case_cb = QCheckBox("Match case")
+        form.addRow("Find:", find_e)
+        form.addRow("Replace with:", repl_e)
+        form.addRow("", case_cb)
+        lay.addLayout(form)
+        info = QLabel("")
+        info.setStyleSheet("color:#6b7280; font-size:11px;")
+        lay.addWidget(info)
+        row = QHBoxLayout()
+        b_find = QPushButton("Find next")
+        b_repl = QPushButton("Replace")
+        b_all = QPushButton("Replace all")
+        b_close = QPushButton("Close")
+        for b in (b_find, b_repl, b_all, b_close):
+            row.addWidget(b)
+        lay.addLayout(row)
+
+        from PyQt6.QtGui import QTextDocument
+
+        def flags():
+            return (QTextDocument.FindFlag.FindCaseSensitively
+                    if case_cb.isChecked() else QTextDocument.FindFlag(0))
+
+        def do_find():
+            self._find_q = find_e.text()
+            if not self._find_q:
+                return False
+            if not self.find(self._find_q, flags()):
+                cur = self.textCursor()
+                cur.movePosition(QTextCursor.MoveOperation.Start)
+                self.setTextCursor(cur)
+                if not self.find(self._find_q, flags()):
+                    info.setText("Not found.")
+                    return False
+            info.setText("")
+            return True
+
+        def do_replace():
+            self._repl_q = repl_e.text()
+            tc = self.textCursor()
+            if tc.hasSelection() and (
+                    tc.selectedText() == find_e.text()
+                    or (not case_cb.isChecked()
+                        and tc.selectedText().lower()
+                        == find_e.text().lower())):
+                tc.insertText(repl_e.text())
+            do_find()
+
+        def do_all():
+            self._find_q, self._repl_q = find_e.text(), repl_e.text()
+            if not self._find_q:
+                return
+            tc = self.textCursor()
+            tc.movePosition(QTextCursor.MoveOperation.Start)
+            self.setTextCursor(tc)
+            n = 0
+            cur = self.textCursor()
+            cur.beginEditBlock()
+            while self.find(self._find_q, flags()):
+                self.textCursor().insertText(repl_e.text())
+                n += 1
+                if n > 10000:
+                    break
+            cur.endEditBlock()
+            info.setText(f"Replaced {n} occurrence(s).")
+
+        b_find.clicked.connect(do_find)
+        b_repl.clicked.connect(do_replace)
+        b_all.clicked.connect(do_all)
+        b_close.clicked.connect(dlg.close)
+        find_e.returnPressed.connect(do_find)
+        dlg.show()
 
     # -- find (Ctrl+F, F3 / Shift+F3) ---------------------------------------
     def _find_dialog(self):

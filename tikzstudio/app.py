@@ -16,7 +16,9 @@ from PyQt6.QtWidgets import (QMainWindow, QToolBar, QDockWidget, QLabel,
                              QPlainTextEdit, QInputDialog, QApplication,
                              QListWidget, QListWidgetItem, QDialog,
                              QDialogButtonBox, QLineEdit, QFormLayout,
-                             QToolButton, QMenu)
+                             QToolButton, QMenu, QToolBox, QTreeView,
+                             QSizePolicy)
+from PyQt6.QtGui import QFileSystemModel
 
 from .elements import (TikzDocument, Figure, Style, NodeEl, ImageEl, GridEl,
                        ArcEl, RawEl, LibraryEl, GroupEl, TREE_TEMPLATE,
@@ -82,9 +84,31 @@ class MainWindow(QMainWindow):
         self.canvas.jump_to_code.connect(self._jump_to_code)
         self._pending_shape = None
 
-        # central widget = figure tab bar + canvas
-        central = QWidget(); v = QVBoxLayout(central)
+        # central widget: [left arrow] file-label + fig tabs + canvas [right arrow]
+        central = QWidget()
+        outer = QHBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+        self.left_arrow = QToolButton()
+        self.left_arrow.setArrowType(Qt.ArrowType.LeftArrow)
+        self.left_arrow.setFixedWidth(16)
+        self.left_arrow.setToolTip("Hide / show the left panel")
+        self.left_arrow.setSizePolicy(QSizePolicy.Policy.Fixed,
+                                      QSizePolicy.Policy.Expanding)
+        self.left_arrow.clicked.connect(lambda: self._toggle_panel("left"))
+        self.right_arrow = QToolButton()
+        self.right_arrow.setArrowType(Qt.ArrowType.RightArrow)
+        self.right_arrow.setFixedWidth(16)
+        self.right_arrow.setToolTip("Hide / show the right panel")
+        self.right_arrow.setSizePolicy(QSizePolicy.Policy.Fixed,
+                                       QSizePolicy.Policy.Expanding)
+        self.right_arrow.clicked.connect(lambda: self._toggle_panel("right"))
+        inner = QWidget(); v = QVBoxLayout(inner)
         v.setContentsMargins(0, 0, 0, 0); v.setSpacing(0)
+        self.file_label = QLabel("📄 unsaved document")
+        self.file_label.setStyleSheet(
+            "color:#374151; font-size:11px; padding:2px 6px; "
+            "background:#f3f4f6;")
+        v.addWidget(self.file_label)
         bar = QHBoxLayout()
         self.fig_tabs = QTabBar()
         self.fig_tabs.setTabsClosable(True)
@@ -95,15 +119,16 @@ class MainWindow(QMainWindow):
         addfig.clicked.connect(self._add_figure)
         bar.addWidget(self.fig_tabs, 1); bar.addWidget(addfig)
         v.addLayout(bar); v.addWidget(self.canvas, 1)
+        outer.addWidget(self.left_arrow)
+        outer.addWidget(inner, 1)
+        outer.addWidget(self.right_arrow)
         self.setCentralWidget(central)
 
         self._build_toolbar()
-        self._build_code_dock()
-        self._build_props_dock()
-        self._build_palette_dock()
-        self._build_preview_dock()
+        self._build_panels()
         self._build_menus()
         self._init_library()
+        self._update_file_label()
         self._refresh_fig_tabs()
         self._push_code_to_editor()
         self.statusBar().showMessage(
@@ -226,6 +251,110 @@ class MainWindow(QMainWindow):
         self.grid_spin.valueChanged.connect(self._set_grid_step)
         tb.addWidget(self.grid_spin)
 
+    def _build_panels(self):
+        # LEFT accordion: Properties / Elements / Files
+        self.left_box = QToolBox()
+        self.left_box.addItem(self._make_props_widget(), "🛠  Properties")
+        self.left_box.addItem(self._make_palette_widget(), "⬡  Elements")
+        self.left_box.addItem(self._make_files_widget(), "🗂  Files")
+        self.left_dock = QDockWidget("Panel", self)
+        self.left_dock.setTitleBarWidget(QWidget())   # slim, accordion only
+        self.left_dock.setWidget(self.left_box)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea,
+                           self.left_dock)
+        # RIGHT accordion: Code / Preview
+        self.right_box = QToolBox()
+        self.right_box.addItem(self._make_code_widget(), "⌨  TikZ code")
+        self.right_box.addItem(self._make_preview_widget(),
+                               "🔍  PDF preview && log")
+        self.right_dock = QDockWidget("Panel", self)
+        self.right_dock.setTitleBarWidget(QWidget())
+        self.right_dock.setWidget(self.right_box)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea,
+                           self.right_dock)
+        self.code_dock = self.right_dock          # backward compat
+        self.left_dock.visibilityChanged.connect(
+            lambda vis: self.left_arrow.setArrowType(
+                Qt.ArrowType.LeftArrow if vis else Qt.ArrowType.RightArrow))
+        self.right_dock.visibilityChanged.connect(
+            lambda vis: self.right_arrow.setArrowType(
+                Qt.ArrowType.RightArrow if vis else Qt.ArrowType.LeftArrow))
+
+    def _toggle_panel(self, side):
+        dock = self.left_dock if side == "left" else self.right_dock
+        dock.setVisible(dock.isHidden())
+
+    def _show_code_panel(self):
+        self.right_dock.show()
+        self.right_box.setCurrentIndex(0)
+
+    def _show_preview_panel(self):
+        self.right_dock.show()
+        self.right_box.setCurrentIndex(1)
+
+    def _make_files_widget(self):
+        w = QWidget(); lay = QVBoxLayout(w)
+        lay.setContentsMargins(4, 4, 4, 4)
+        self.fs_label = QLabel("")
+        self.fs_label.setWordWrap(True)
+        self.fs_label.setStyleSheet("color:#6b7280; font-size:11px;")
+        lay.addWidget(self.fs_label)
+        self.fs_model = QFileSystemModel()
+        self.fs_model.setRootPath(self.base_dir)
+        self.fs_tree = QTreeView()
+        self.fs_tree.setModel(self.fs_model)
+        self.fs_tree.setRootIndex(self.fs_model.index(self.base_dir))
+        for col in (1, 2, 3):
+            self.fs_tree.hideColumn(col)
+        self.fs_tree.setHeaderHidden(True)
+        self.fs_tree.doubleClicked.connect(self._fs_open)
+        lay.addWidget(self.fs_tree, 1)
+        hint = QLabel("Double-click: open .tex/.tikz, insert images.")
+        hint.setStyleSheet("color:#6b7280; font-size:11px;")
+        lay.addWidget(hint)
+        self._refresh_fs()
+        return w
+
+    def _refresh_fs(self):
+        if hasattr(self, "fs_model"):
+            self.fs_model.setRootPath(self.base_dir)
+            self.fs_tree.setRootIndex(self.fs_model.index(self.base_dir))
+            self.fs_label.setText(f"Folder: {self.base_dir}")
+
+    def _fs_open(self, index):
+        path = self.fs_model.filePath(index)
+        if os.path.isdir(path):
+            return
+        low = path.lower()
+        if low.endswith((".tex", ".tikz", ".pgf", ".txt")):
+            self._load_tex_file(path)
+        elif low.endswith((".png", ".jpg", ".jpeg", ".pdf", ".eps")):
+            if "graphicx" not in self.doc.packages:
+                self.doc.packages.append("graphicx")
+            self.fig().elements.append(
+                ImageEl(x=0, y=0, path=self.canvas._relativize(path),
+                        width=3.0))
+            self.canvas.rebuild_scene()
+            self._push_code_to_editor()
+            self._push_history()
+            self.statusBar().showMessage(
+                f"Inserted image {os.path.basename(path)}.", 4000)
+
+    def _update_file_label(self):
+        name = self.file_path or "unsaved document"
+        self.file_label.setText(f"📄 {name}")
+        self.setWindowTitle(
+            f"TikZ Studio — {os.path.basename(self.file_path)}"
+            if self.file_path else "TikZ Studio")
+
+    def _preview_zoom(self, factor):
+        if factor is None:
+            self._pv_zoom = 1.0
+        else:
+            self._pv_zoom = max(0.15, min(8.0, self._pv_zoom * factor))
+        self.zoom_label.setText(f"{round(self._pv_zoom * 100)}%")
+        self._show_page(self.page_combo.currentIndex())
+
     def _tool_changed_ui(self, tool):
         if tool in self.tool_actions:
             self.tool_actions[tool].setChecked(True)
@@ -242,7 +371,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Grid / snap step: {v:g} cm", 3000)
 
-    def _build_code_dock(self):
+    def _make_code_widget(self):
         self.editor = TikzEditor()
         self.editor.textChanged.connect(self._editor_changed)
         w = QWidget(); lay = QVBoxLayout(w)
@@ -266,14 +395,16 @@ class MainWindow(QMainWindow):
         hint.setStyleSheet("color:#6b7280; font-size:11px;")
         lay.addWidget(hint); lay.addWidget(self.editor, 1)
         self.editor.jump_handler = self._jump_to_canvas
-        dock = QDockWidget("TikZ code", self)
-        dock.setWidget(w)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
-        self.code_dock = dock
+        return w
 
-    def _build_props_dock(self):
+    def _make_props_widget(self):
         w = QWidget(); self.props_form = QFormLayout(w)
-        self.props_widgets = {}
+        self._prop_rows = {}
+
+        def _row(key, label, widget):
+            self.props_form.addRow(label, widget)
+            self._prop_rows[key] = widget
+        self._row = _row
 
         self.p_draw = QPushButton("stroke")
         self.p_draw.clicked.connect(lambda: self._pick_color("draw"))
@@ -297,19 +428,19 @@ class MainWindow(QMainWindow):
         self.p_op.setSingleStep(0.1); self.p_op.setValue(1.0)
         self.p_op.valueChanged.connect(lambda v: self._set_style("opacity", v))
 
-        self.props_form.addRow("Stroke colour", self.p_draw)
-        self.props_form.addRow("Fill colour", self.p_fill)
-        self.props_form.addRow("Line width", self.p_lw)
-        self.props_form.addRow("Dash", self.p_dash)
-        self.props_form.addRow("Arrow tips", self.p_arrow)
-        self.props_form.addRow("Opacity", self.p_op)
+        _row("stroke", "Stroke colour", self.p_draw)
+        _row("fill", "Fill colour", self.p_fill)
+        _row("lw", "Line width", self.p_lw)
+        _row("dash", "Dash", self.p_dash)
+        _row("arrow", "Arrow tips", self.p_arrow)
+        _row("op", "Opacity", self.p_op)
         self.p_fop = QDoubleSpinBox(); self.p_fop.setRange(0.0, 1.0)
         self.p_fop.setSingleStep(0.1); self.p_fop.setValue(1.0)
         self.p_fop.setToolTip("Transparency of the fill only "
                               "(TikZ 'fill opacity')")
         self.p_fop.valueChanged.connect(
             lambda v: self._set_style("fill_opacity", v))
-        self.props_form.addRow("Fill opacity", self.p_fop)
+        _row("fop", "Fill opacity", self.p_fop)
 
         # LaTeX text formatting for the selected node
         fmt_row = QHBoxLayout()
@@ -330,57 +461,57 @@ class MainWindow(QMainWindow):
         fmt_row.addWidget(self.p_under); fmt_row.addWidget(self.p_tcolor)
         fmt_row.addStretch()
         fw = QWidget(); fw.setLayout(fmt_row)
-        self.props_form.addRow("Text format", fw)
+        _row("tfmt", "Text format", fw)
         self.p_tsize = QComboBox(); self.p_tsize.addItems(SIZES)
         self.p_tsize.setCurrentText("normalsize")
         self.p_tsize.currentTextChanged.connect(
             lambda _: self._apply_text_format())
-        self.props_form.addRow("Text size", self.p_tsize)
+        _row("tsize", "Text size", self.p_tsize)
 
         self.p_star_n = QSpinBox(); self.p_star_n.setRange(3, 12); self.p_star_n.setValue(5)
         self.p_star_n.valueChanged.connect(
             lambda v: setattr(self.canvas, "star_points", v))
-        self.props_form.addRow("Star points", self.p_star_n)
+        _row("star", "Star points", self.p_star_n)
 
         # contextual (selection) fields
         self.p_a1 = QDoubleSpinBox(); self.p_a1.setRange(-360, 360)
         self.p_a2 = QDoubleSpinBox(); self.p_a2.setRange(-360, 360)
         for sb, attr in ((self.p_a1, "a1"), (self.p_a2, "a2")):
             sb.valueChanged.connect(lambda v, a=attr: self._set_attr(a, v))
-        self.props_form.addRow("Arc start °", self.p_a1)
-        self.props_form.addRow("Arc end °", self.p_a2)
+        _row("a1", "Arc start °", self.p_a1)
+        _row("a2", "Arc end °", self.p_a2)
         self.p_step = QDoubleSpinBox(); self.p_step.setRange(0.05, 10)
         self.p_step.setSingleStep(0.25); self.p_step.setValue(0.5)
         self.p_step.valueChanged.connect(lambda v: self._set_attr("step", v))
-        self.props_form.addRow("Grid step", self.p_step)
+        _row("step", "Grid step", self.p_step)
         self.p_imgw = QDoubleSpinBox(); self.p_imgw.setRange(0.2, 30)
         self.p_imgw.setValue(3.0); self.p_imgw.setSuffix(" cm")
         self.p_imgw.valueChanged.connect(lambda v: self._set_attr("width", v))
-        self.props_form.addRow("Image width", self.p_imgw)
+        _row("imgw", "Image width", self.p_imgw)
         self.p_imgh = QDoubleSpinBox(); self.p_imgh.setRange(0.0, 30)
         self.p_imgh.setValue(0.0); self.p_imgh.setSuffix(" cm")
         self.p_imgh.setSpecialValueText("auto")
         self.p_imgh.setToolTip("graphicx height= (0 = auto from width)")
         self.p_imgh.valueChanged.connect(lambda v: self._set_attr("height", v))
-        self.props_form.addRow("Image height", self.p_imgh)
+        _row("imgh", "Image height", self.p_imgh)
         self.p_scale = QDoubleSpinBox(); self.p_scale.setRange(0.05, 20)
         self.p_scale.setSingleStep(0.1); self.p_scale.setValue(1.0)
         self.p_scale.setToolTip("Scale of the selected scope group")
         self.p_scale.valueChanged.connect(lambda v: self._set_attr("s", v))
-        self.props_form.addRow("Group scale", self.p_scale)
+        _row("gscale", "Group scale", self.p_scale)
         self.p_grot = QDoubleSpinBox(); self.p_grot.setRange(-360, 360)
         self.p_grot.valueChanged.connect(lambda v: self._set_attr("rot", v))
-        self.props_form.addRow("Group rotate °", self.p_grot)
+        _row("grot", "Group rotate °", self.p_grot)
         self.p_gxs = QDoubleSpinBox(); self.p_gxs.setRange(-20, 20)
         self.p_gxs.setValue(1.0); self.p_gxs.setSingleStep(0.1)
         self.p_gxs.setToolTip("xscale (negative mirrors horizontally)")
         self.p_gxs.valueChanged.connect(lambda v: self._set_attr("xs", v))
-        self.props_form.addRow("Group xscale", self.p_gxs)
+        _row("gxs", "Group xscale", self.p_gxs)
         self.p_gys = QDoubleSpinBox(); self.p_gys.setRange(-20, 20)
         self.p_gys.setValue(1.0); self.p_gys.setSingleStep(0.1)
         self.p_gys.setToolTip("yscale (negative mirrors vertically)")
         self.p_gys.valueChanged.connect(lambda v: self._set_attr("ys", v))
-        self.props_form.addRow("Group yscale", self.p_gys)
+        _row("gys", "Group yscale", self.p_gys)
 
         self.sel_label = QLabel("New shapes use these style settings.\n"
                                 "Select one element to edit it.")
@@ -388,18 +519,31 @@ class MainWindow(QMainWindow):
         self.sel_label.setStyleSheet("color:#6b7280;")
         self.props_form.addRow(self.sel_label)
 
-        scroll = QScrollArea(); scroll.setWidget(w); scroll.setWidgetResizable(True)
-        dock = QDockWidget("Properties", self)
-        dock.setWidget(scroll)
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
-        self._show_properties(None)
+        scroll = QScrollArea(); scroll.setWidget(w)
+        scroll.setWidgetResizable(True)
+        self._show_properties([])
+        return scroll
 
-    def _build_preview_dock(self):
+    def _make_preview_widget(self):
         w = QWidget(); lay = QVBoxLayout(w)
         top = QHBoxLayout()
         self.page_combo = QComboBox()
         self.page_combo.currentIndexChanged.connect(self._show_page)
         top.addWidget(QLabel("Page:")); top.addWidget(self.page_combo)
+        self._pv_zoom = 1.0
+        zo = QToolButton(); zo.setText("−")
+        zo.setToolTip("Zoom out preview")
+        zo.clicked.connect(lambda: self._preview_zoom(1 / 1.25))
+        zi = QToolButton(); zi.setText("＋")
+        zi.setToolTip("Zoom in preview")
+        zi.clicked.connect(lambda: self._preview_zoom(1.25))
+        zr = QToolButton(); zr.setText("1:1")
+        zr.setToolTip("Reset preview zoom")
+        zr.clicked.connect(lambda: self._preview_zoom(None))
+        self.zoom_label = QLabel("100%")
+        for b in (zo, zi, zr):
+            top.addWidget(b)
+        top.addWidget(self.zoom_label)
         top.addStretch()
         self.compile_state = QLabel("not compiled")
         top.addWidget(self.compile_state)
@@ -413,12 +557,8 @@ class MainWindow(QMainWindow):
         self.log_view.setMaximumHeight(110)
         self.log_view.setStyleSheet("font-family:monospace; font-size:11px;")
         lay.addWidget(self.log_view)
-        dock = QDockWidget("PDF preview && log", self)
-        dock.setWidget(w)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
-        self.tabifyDockWidget(self.code_dock, dock)
-        self.code_dock.raise_()
         self._pages = []
+        return w
 
     def _build_menus(self):
         m = self.menuBar()
@@ -590,40 +730,79 @@ class MainWindow(QMainWindow):
     # ==================================================================
     # properties
     # ==================================================================
-    def _current_style_target(self):
-        sel = self.canvas.selected_elements()
-        return sel[0].style if sel else self.canvas.default_style
+    PROP_KEYS = None  # computed per element
+
+    @staticmethod
+    def _element_prop_keys(e):
+        from .elements import (LineEl, RectEl, CircleEl, EllipseEl, PolyEl,
+                               BezierEl, PlotEl, ArcEl, GridEl, NodeEl,
+                               ImageEl, LibraryEl, GroupEl)
+        base = {"stroke", "lw", "dash", "op"}
+        closed = base | {"fill", "fop"}
+        if isinstance(e, (LineEl, BezierEl)):
+            return base | {"arrow"}
+        if isinstance(e, PlotEl):
+            return base | {"arrow"}
+        if isinstance(e, PolyEl):
+            return closed | (set() if e.closed else {"arrow"})
+        if isinstance(e, (RectEl, CircleEl, EllipseEl)):
+            return closed
+        if isinstance(e, ArcEl):
+            return base | {"arrow", "a1", "a2"}
+        if isinstance(e, GridEl):
+            return base | {"step"}
+        if isinstance(e, NodeEl):
+            return closed | {"tfmt", "tsize"}
+        if isinstance(e, ImageEl):
+            return {"op", "imgw", "imgh"}
+        if isinstance(e, LibraryEl):
+            return {"op"}
+        if isinstance(e, GroupEl):
+            return {"gscale", "grot", "gxs", "gys"}
+        return set()
+
+    def _selected(self):
+        return self.canvas.selected_elements()
 
     def _set_style(self, attr, value):
         if self._syncing:
             return
-        st = self._current_style_target()
-        setattr(st, attr, value)
-        if self.canvas.selected_elements():
+        sel = self._selected()
+        targets = [e.style for e in sel] if sel else [self.canvas.default_style]
+        for st in targets:
+            setattr(st, attr, value)
+        if sel:
             self.canvas.refresh_selected()
             self._push_code_to_editor()
-        self._paint_color_buttons(st)
+            self._push_history()
+        self._paint_color_buttons(targets[0])
 
     def _set_attr(self, attr, value):
         if self._syncing:
             return
-        sel = self.canvas.selected_elements()
-        if sel and hasattr(sel[0], attr):
-            setattr(sel[0], attr, value)
+        changed = False
+        for el in self._selected():
+            if hasattr(el, attr):
+                setattr(el, attr, value)
+                changed = True
+        if changed:
             self.canvas.refresh_selected()
             self._push_code_to_editor()
+            self._push_history()
 
     def _pick_color(self, which):
-        st = self._current_style_target()
-        cur = getattr(st, which) or "black"
+        sel = self._selected()
+        st0 = sel[0].style if sel else self.canvas.default_style
+        cur = getattr(st0, which) or "black"
         c = QColorDialog.getColor(QColor(cur.split("!")[0]) if QColor(
             cur.split("!")[0]).isValid() else QColor("black"), self)
         if c.isValid():
             tikz = f"{{rgb,255:red,{c.red()};green,{c.green()};blue,{c.blue()}}}"
-            named = {"#000000": "black", "#ff0000": "red", "#00ff00": "green",
-                     "#0000ff": "blue", "#ffffff": "white", "#ffff00": "yellow",
+            named = {"#000000": "black", "#ff0000": "red",
+                     "#00ff00": "green", "#0000ff": "blue",
+                     "#ffffff": "white", "#ffff00": "yellow",
                      "#00ffff": "cyan", "#ff00ff": "magenta",
-                     "#ffa500": "orange", "#808080": "gray"}
+                     "#ff8000": "orange", "#808080": "gray"}
             tikz = named.get(c.name(), tikz)
             self._set_style(which, tikz)
 
@@ -634,18 +813,42 @@ class MainWindow(QMainWindow):
         f = qcolor(st.fill) if st.fill else QColor("#ffffff")
         self.p_fill.setStyleSheet(f"background:{f.name()};")
 
-    def _show_properties(self, element):
+    def _set_row_visible(self, key, visible):
+        wdg = self._prop_rows.get(key)
+        if wdg is None:
+            return
+        try:
+            self.props_form.setRowVisible(wdg, visible)
+        except (AttributeError, TypeError):
+            wdg.setVisible(visible)
+        wdg.setEnabled(visible)
+
+    def _show_properties(self, sel):
+        if sel is None:
+            sel = []
+        elif not isinstance(sel, list):
+            sel = [sel]
         self._syncing = True
-        st = element.style if element else self.canvas.default_style
+        element = sel[0] if len(sel) == 1 else None
+
+        # visible = intersection of every selected element's valid fields
+        if not sel:
+            keys = {"stroke", "fill", "lw", "dash", "arrow",
+                    "op", "fop", "star"}
+        else:
+            keys = self._element_prop_keys(sel[0])
+            for e in sel[1:]:
+                keys &= self._element_prop_keys(e)
+        for k in self._prop_rows:
+            self._set_row_visible(k, k in keys)
+
+        st = sel[0].style if sel else self.canvas.default_style
         self.p_lw.setValue(st.line_width)
         self.p_dash.setCurrentText(st.dash)
         self.p_arrow.setCurrentText(st.arrows)
         self.p_op.setValue(st.opacity)
         self.p_fop.setValue(st.fill_opacity)
         is_node = isinstance(element, NodeEl)
-        for wdg in (self.p_bold, self.p_italic, self.p_under,
-                    self.p_tcolor, self.p_tsize):
-            wdg.setEnabled(is_node)
         if is_node:
             fmt = parse_format(element.text)
             self.p_bold.setChecked(fmt.bold)
@@ -653,36 +856,33 @@ class MainWindow(QMainWindow):
             self.p_under.setChecked(fmt.underline)
             self.p_tsize.setCurrentText(fmt.size)
         self._paint_color_buttons(st)
-        is_arc = isinstance(element, ArcEl)
-        is_grid = isinstance(element, GridEl)
-        is_img = isinstance(element, ImageEl)
-        is_grp = isinstance(element, GroupEl)
-        self.p_a1.setEnabled(is_arc); self.p_a2.setEnabled(is_arc)
-        self.p_step.setEnabled(is_grid); self.p_imgw.setEnabled(is_img)
-        self.p_imgh.setEnabled(is_img)
-        self.p_scale.setEnabled(is_grp)
-        for wdg in (self.p_grot, self.p_gxs, self.p_gys):
-            wdg.setEnabled(is_grp)
-        if is_grp:
+        if isinstance(element, ArcEl):
+            self.p_a1.setValue(element.a1); self.p_a2.setValue(element.a2)
+        if isinstance(element, GridEl):
+            self.p_step.setValue(element.step)
+        if isinstance(element, ImageEl):
+            self.p_imgw.setValue(element.width)
+            self.p_imgh.setValue(element.height)
+        if isinstance(element, GroupEl):
             self.p_scale.setValue(element.s)
             self.p_grot.setValue(element.rot)
             self.p_gxs.setValue(element.xs)
             self.p_gys.setValue(element.ys)
-        if is_arc:
-            self.p_a1.setValue(element.a1); self.p_a2.setValue(element.a2)
-        if is_grid:
-            self.p_step.setValue(element.step)
-        if is_img:
-            self.p_imgw.setValue(element.width)
-            self.p_imgh.setValue(element.height)
-        if element is None:
-            self.sel_label.setText("New shapes use these style settings.\n"
-                                   "Select one element to edit it.")
+
+        if not sel:
+            self.sel_label.setText(
+                "New shapes use these style settings.\n"
+                "Select elements to edit them.")
+        elif len(sel) > 1:
+            self.sel_label.setText(
+                f"{len(sel)} elements selected — the shared fields above "
+                "apply to ALL of them (bulk edit). Drag or use arrow keys "
+                "to move them together.")
         elif isinstance(element, GroupEl):
             self.sel_label.setText(
                 f"Selected: scope group ({len(element.children)} elements)\n"
-                "Drag to move all together; 'Group scale' resizes the whole "
-                "group. Ctrl+Shift+G ungroups (bakes the transform).")
+                "Drag to move all together; scale/rotate/x-yscale resize "
+                "the whole group. Ctrl+Shift+G ungroups.")
         else:
             self.sel_label.setText(
                 f"Selected: {type(element).__name__.replace('El','')}\n"
@@ -718,7 +918,7 @@ class MainWindow(QMainWindow):
                                      QTextCursor.MoveMode.KeepAnchor)
                 self.editor.setTextCursor(cur)
                 self.editor.setFocus()
-                self.code_dock.raise_()
+                self._show_code_panel()
                 self.statusBar().showMessage(
                     f"Code line {start + 1}: "
                     f"{type(element).__name__.replace('El', '')}", 4000)
@@ -904,13 +1104,21 @@ class MainWindow(QMainWindow):
     # ==================================================================
     # element library palette
     # ==================================================================
-    def _build_palette_dock(self):
+    def _make_palette_widget(self):
         w = QWidget(); lay = QVBoxLayout(w)
         lay.setContentsMargins(4, 4, 4, 4)
         self.lib_status = QLabel("Element library")
         self.lib_status.setWordWrap(True)
         self.lib_status.setStyleSheet("color:#6b7280; font-size:11px;")
         lay.addWidget(self.lib_status)
+        grp_row = QHBoxLayout()
+        grp_row.addWidget(QLabel("Group:"))
+        self.pal_group = QComboBox()
+        self.pal_group.addItem("All")
+        self.pal_group.currentTextChanged.connect(
+            lambda _: self._fill_palette())
+        grp_row.addWidget(self.pal_group, 1)
+        lay.addLayout(grp_row)
         self.palette = QListWidget()
         self.palette.setViewMode(QListWidget.ViewMode.IconMode)
         self.palette.setIconSize(QSize(46, 46))
@@ -931,9 +1139,10 @@ class MainWindow(QMainWindow):
         rebuild.clicked.connect(lambda: self._start_library_build(force=True))
         row.addWidget(add, 1); row.addWidget(rebuild)
         lay.addLayout(row)
-        dock = QDockWidget("Elements", self)
-        dock.setWidget(w)
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+        self.palette.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.palette.customContextMenuRequested.connect(self._palette_menu)
+        return w
 
     def _init_library(self):
         if REGISTRY.load() and any(not s.custom
@@ -968,8 +1177,18 @@ class MainWindow(QMainWindow):
     def _fill_palette(self):
         from PyQt6.QtGui import QIcon
         self.palette.clear()
-        shapes = sorted(REGISTRY.shapes.values(),
-                        key=lambda s: (s.custom, s.name))
+        groups = sorted({sh.group for sh in REGISTRY.shapes.values()})
+        cur = self.pal_group.currentText() or "All"
+        self.pal_group.blockSignals(True)
+        self.pal_group.clear()
+        self.pal_group.addItems(["All"] + groups)
+        if cur in ["All"] + groups:
+            self.pal_group.setCurrentText(cur)
+        self.pal_group.blockSignals(False)
+        want = self.pal_group.currentText()
+        shapes = sorted((sh for sh in REGISTRY.shapes.values()
+                         if want in ("All", sh.group)),
+                        key=lambda s: (s.custom, s.group, s.name))
         for sh in shapes:
             label = ("★ " if sh.custom else "") + sh.name
             it = QListWidgetItem(label)
@@ -980,8 +1199,42 @@ class MainWindow(QMainWindow):
             self.palette.addItem(it)
         if not self.lib_status.text().startswith("Library build failed"):
             self.lib_status.setText(
-                f"{len(shapes)} elements — click one, then click the "
-                "canvas to place it.")
+                f"{len(shapes)} element(s) in "
+                f"'{self.pal_group.currentText()}' — click one, then "
+                "click the canvas to place it.")
+
+    def _palette_menu(self, pos):
+        item = self.palette.itemAt(pos)
+        if item is None:
+            return
+        name = item.data(Qt.ItemDataRole.UserRole)
+        sh = REGISTRY.get(name)
+        if sh is None:
+            return
+        menu = QMenu(self)
+        info = menu.addAction(f"Group: {sh.group}")
+        info.setEnabled(False)
+        if sh.custom:
+            chg = menu.addAction("Change group…")
+            rm = menu.addAction("Delete custom element")
+            act = menu.exec(self.palette.mapToGlobal(pos))
+            if act is chg:
+                g, ok = QInputDialog.getText(
+                    self, "Change group", "Group name:", text=sh.group)
+                if ok and g.strip():
+                    sh.group = g.strip()
+                    REGISTRY.save()
+                    self._fill_palette()
+            elif act is rm:
+                if QMessageBox.question(
+                        self, "Delete element",
+                        f"Delete custom element '{sh.name}'?") \
+                        == QMessageBox.StandardButton.Yes:
+                    del REGISTRY.shapes[sh.name]
+                    REGISTRY.save()
+                    self._fill_palette()
+        else:
+            menu.exec(self.palette.mapToGlobal(pos))
 
     def _palette_clicked(self, item):
         name = item.data(Qt.ItemDataRole.UserRole)
@@ -1022,9 +1275,17 @@ class MainWindow(QMainWindow):
         libs_e.setPlaceholderText("e.g. shapes.geometric, decorations.markings")
         pkgs_e = QLineEdit()
         pkgs_e.setPlaceholderText("e.g. pgfplots (optional)")
+        group_e = QComboBox()
+        group_e.setEditable(True)
+        existing = sorted({sh.group for sh in REGISTRY.shapes.values()
+                           if sh.custom} | {"My elements"})
+        group_e.addItems(existing)
+        group_e.setToolTip("Palette group for this element — type a new "
+                           "name to create a group")
         form.addRow("Name:", name_e)
         form.addRow("TikZ libraries:", libs_e)
         form.addRow("Packages:", pkgs_e)
+        form.addRow("Group:", group_e)
         lay.addLayout(form)
         hint = QLabel(
             "TikZ code drawn around (0,0). Use @X@,@Y@ as the anchor, or "
@@ -1067,7 +1328,9 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
             shape, err = compile_custom(name, code_e.toPlainText(),
                                         libs, pkgs,
-                                        self.doc.extra_preamble)
+                                        self.doc.extra_preamble,
+                                        group=group_e.currentText().strip()
+                                        or "My elements")
             ok_btn.setEnabled(True)
             ok_btn.setText("Compile && add")
             if shape is None:
@@ -1164,6 +1427,7 @@ class MainWindow(QMainWindow):
             self.compile_state.setText("✓ compiled")
             self.compile_state.setStyleSheet("color:#047857;")
             self._show_page(0)
+            self._show_preview_panel()
         else:
             self.compile_state.setText("✗ error — see log")
             self.compile_state.setStyleSheet("color:#dc2626;")
@@ -1174,6 +1438,12 @@ class MainWindow(QMainWindow):
     def _show_page(self, idx):
         if 0 <= idx < len(self._pages):
             pm = QPixmap(self._pages[idx])
+            z = getattr(self, "_pv_zoom", 1.0)
+            if abs(z - 1.0) > 1e-9:
+                pm = pm.scaled(
+                    round(pm.width() * z), round(pm.height() * z),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation)
             self.preview_label.setPixmap(pm)
             self.preview_label.resize(pm.size())
 
@@ -1230,6 +1500,7 @@ class MainWindow(QMainWindow):
                 return
             self.file_path = path
             self._set_base_dir(os.path.dirname(os.path.abspath(path)))
+            self._update_file_label()
         with open(self.file_path, "w", encoding="utf-8") as f:
             f.write(self.doc.full_document())
         self.statusBar().showMessage(f"Saved {self.file_path}", 5000)
@@ -1238,13 +1509,16 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open TikZ / LaTeX file", self.base_dir or "",
             "TikZ / LaTeX (*.tex *.tikz *.pgf *.txt);;All files (*)")
-        if not path:
-            return
+        if path:
+            self._load_tex_file(path)
+
+    def _load_tex_file(self, path):
         with open(path, encoding="utf-8") as f:
             text = f.read()
         self.doc = import_tex(text)
         self.file_path = path
         self._set_base_dir(os.path.dirname(os.path.abspath(path)))
+        self._update_file_label()
         self.current_fig = 0
         self._refresh_fig_tabs()
         self._push_code_to_editor()
@@ -1270,6 +1544,7 @@ class MainWindow(QMainWindow):
         self.canvas.clear_pixmap_cache()
         self.compiler.base_dir = folder
         self.canvas.viewport().update()
+        self._refresh_fs()
         self.statusBar().showMessage(
             f"Working folder: {folder} — images there can be referenced "
             "with relative paths.", 6000)
@@ -1283,6 +1558,7 @@ class MainWindow(QMainWindow):
             self.current_fig = 0
             self._refresh_fig_tabs()
             self._push_code_to_editor()
+            self._update_file_label()
 
     def _about(self):
         QMessageBox.about(

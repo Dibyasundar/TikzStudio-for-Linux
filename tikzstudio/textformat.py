@@ -48,6 +48,17 @@ def parse_format(text: str) -> TextFormat:
         if m:
             f.size = m.group(1); t = m.group(2).strip(); changed = True
             continue
+        # legacy two-letter switches: {\bf x}, {\it x}, {\em x},
+        # and prefix forms  \bf x  /  \it x
+        m = re.fullmatch(r"\{\\bf\s+(.*)\}", t, re.S) \
+            or re.fullmatch(r"\\bf\s+(.*)", t, re.S)
+        if m:
+            f.bold = True; t = m.group(1).strip(); changed = True; continue
+        m = re.fullmatch(r"\{\\(?:it|em)\s+(.*)\}", t, re.S) \
+            or re.fullmatch(r"\\(?:it|em)\s+(.*)", t, re.S)
+        if m:
+            f.italic = True; t = m.group(1).strip(); changed = True
+            continue
     f.inner = t
     return f
 

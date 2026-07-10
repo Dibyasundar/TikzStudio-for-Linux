@@ -96,12 +96,31 @@ CATALOG = [
 ]
 
 
+CATEGORIES = {}
+for _n, _l, _t in CATALOG:
+    if "flow" in _n:
+        CATEGORIES[_n] = "Flowchart"
+    elif "path" in _n or _n == "brace":
+        CATEGORIES[_n] = "Paths"
+    elif "callout" in _n:
+        CATEGORIES[_n] = "Callouts"
+    elif "arrow" in _n:
+        CATEGORIES[_n] = "Arrows"
+    elif _n in ("cloud", "starburst", "signal", "tape", "forbidden sign",
+                "magnifying glass"):
+        CATEGORIES[_n] = "Symbols"
+    elif _n in ("rounded rectangle", "chamfered rectangle", "cross out"):
+        CATEGORIES[_n] = "Misc"
+    else:
+        CATEGORIES[_n] = "Geometric"
+
+
 # ----------------------------------------------------------------------
 # Registry
 # ----------------------------------------------------------------------
 class LibShape:
     def __init__(self, name, libraries, template, thumb="", size_cm=(1, 1),
-                 custom=False, packages=None):
+                 custom=False, packages=None, group=""):
         self.name = name
         self.libraries = libraries
         self.template = template
@@ -109,6 +128,7 @@ class LibShape:
         self.size_cm = tuple(size_cm)
         self.custom = custom
         self.packages = packages or []
+        self.group = group or ("My elements" if custom else "Other")
         self._rx = None
 
     def instantiate(self, x, y) -> str:
@@ -133,7 +153,7 @@ class LibShape:
         return {"name": self.name, "libraries": self.libraries,
                 "template": self.template, "thumb": self.thumb,
                 "size_cm": list(self.size_cm), "custom": self.custom,
-                "packages": self.packages}
+                "packages": self.packages, "group": self.group}
 
 
 class Registry:
@@ -157,7 +177,12 @@ class Registry:
             for d in data:
                 if d.get("thumb") and not os.path.exists(d["thumb"]):
                     d["thumb"] = ""
-                self.add(LibShape(**d))
+                sh = LibShape(**d)
+                # migrate caches created before element groups existed
+                if not sh.custom and sh.group in ("", "Other") \
+                        and sh.name in CATEGORIES:
+                    sh.group = CATEGORIES[sh.name]
+                self.add(sh)
             return bool(self.shapes)
         except (json.JSONDecodeError, TypeError, OSError):
             return False
@@ -237,11 +262,13 @@ def compile_catalog(entries, progress=None):
             shutil.copy(os.path.join(wd, png), dest)
             img = QImage(dest)
             size_cm = (img.width() / PX_PER_CM, img.height() / PX_PER_CM)
-            shapes.append(LibShape(name, libs, tpl, dest, size_cm))
+            shapes.append(LibShape(name, libs, tpl, dest, size_cm,
+                                   group=CATEGORIES.get(name, "Other")))
     return shapes, ""
 
 
-def compile_custom(name, code, libraries, packages, extra_preamble=""):
+def compile_custom(name, code, libraries, packages, extra_preamble="",
+                   group="My elements"):
     """Test-compile one user element and create its thumbnail.
 
     `code` is TikZ drawn around the origin.  If it contains no @X@/@Y@
@@ -287,7 +314,8 @@ def compile_custom(name, code, libraries, packages, extra_preamble=""):
         img = QImage(dest)
         size_cm = (img.width() / PX_PER_CM, img.height() / PX_PER_CM)
     return LibShape(name, libraries, code, dest, size_cm,
-                    custom=True, packages=packages), ""
+                    custom=True, packages=packages,
+                    group=group or "My elements"), ""
 
 
 # ----------------------------------------------------------------------

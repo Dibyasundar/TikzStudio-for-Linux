@@ -632,7 +632,7 @@ def make_item(e: Element, canvas: "Canvas") -> ElementItem:
 # ----------------------------------------------------------------------
 class Canvas(QGraphicsView):
     model_changed = pyqtSignal()          # visual edit -> regenerate code
-    selection_changed = pyqtSignal(object)  # Element or None
+    selection_changed = pyqtSignal(list)    # list of selected Elements
     status = pyqtSignal(str)
     place_requested = pyqtSignal(float, float)
     tool_changed = pyqtSignal(str)
@@ -726,7 +726,7 @@ class Canvas(QGraphicsView):
                 self._scene.addItem(make_item(el, self))
         self._scene.blockSignals(False)
         self.viewport().update()
-        self.selection_changed.emit(None)
+        self.selection_changed.emit([])
 
     def selected_elements(self):
         return [it.element for it in self._scene.selectedItems()
@@ -745,8 +745,7 @@ class Canvas(QGraphicsView):
         if len(items) == 1 and items[0].element.handles():
             items[0].show_handles()
             self._handle_owner = items[0]
-        self.selection_changed.emit(items[0].element
-                                    if len(items) == 1 else None)
+        self.selection_changed.emit([it.element for it in items])
 
     def commit_moved_items(self):
         """Write back every dragged item's offset into the model — a
