@@ -131,16 +131,3 @@ sudo apt install python3-pyqt6 texlive-latex-extra texlive-pictures poppler-util
 python3 run.py
 ```
 
-## Layout
-
-```
-tikzstudio/
-  elements.py   data model + TikZ code generation
-  parser.py     TikZ -> model (two-way sync, lossless via RawEl)
-  canvas.py     QGraphicsView drawing canvas & tools
-  editor.py     code editor: highlighting, completion, number scrubbing
-  compiler.py   background pdflatex + pdftoppm preview
-  library.py    pre-compiled element library, cache & custom elements
-  dialogs.py    package/library manager
-  app.py        main window
-```
