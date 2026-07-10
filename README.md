@@ -227,3 +227,9 @@ tikzstudio/
   dialogs.py    package/library manager
   app.py        main window
 ```
+## Screenshot of UI
+<img width="1845" height="1020" alt="UI" src="https://github.com/user-attachments/assets/d74efc4b-3cd7-4a84-963a-1dbb186145c8" />
+
+## Screenshot of Image in TikZ Studio
+<img width="1848" height="1003" alt="example" src="https://github.com/user-attachments/assets/6d0f266a-98be-4b2a-a41a-3bd008c3d76d" />
+
