@@ -5,7 +5,7 @@ import os
 import re as _re
 from typing import List, Optional, Tuple
 
-from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal
+from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal, QThread
 from PyQt6.QtGui import (QPainter, QPen, QBrush, QColor, QPainterPath,
                          QPixmap, QFont, QTransform, QFontMetricsF)
 from PyQt6.QtWidgets import (QGraphicsView, QGraphicsScene, QGraphicsItem,
@@ -18,7 +18,7 @@ import dataclasses
 from .elements import (SCALE, Style, Element, LineEl, RectEl, CircleEl,
                        EllipseEl, PolyEl, BezierEl, PlotEl, ArcEl, GridEl,
                        NodeEl, ImageEl, RawEl, LibraryEl, GroupEl, CurveEl,
-                       PgfEl, Figure, catmull_to_curve)
+                       PgfEl, AxisEl, Figure, catmull_to_curve)
 
 TOOLS = ["select", "line", "arrow", "rect", "circle", "ellipse", "polygon",
          "bezier", "freehand", "arc", "grid", "node", "image"]
@@ -164,35 +164,186 @@ def _pgf_tip(token: str, end: bool) -> str:
 
 
 # ----------------------------------------------------------------------
+# decorations (decorate, decoration={type, params})
+# ----------------------------------------------------------------------
+def decoration_of(style: Style):
+    """Extract a decoration spec from the preserved options."""
+    if not any(x.strip() == "decorate" or x.strip().startswith("decoration=")
+               for x in style.extra):
+        return None
+    spec = {"type": "", "amplitude": 4.0, "seg": 10.0, "mirror": False,
+            "text": ""}
+    from .parser import dim_to_cm, split_top_commas
+    for x in style.extra:
+        x = x.strip()
+        if not x.startswith("decoration="):
+            continue
+        inner = x[len("decoration="):].strip()
+        if inner.startswith("{") and inner.endswith("}"):
+            inner = inner[1:-1]
+        for it in split_top_commas(inner):
+            it = it.strip()
+            low = it.lower()
+            if low in ("snake", "zigzag", "saw", "coil", "random steps",
+                       "brace", "text along path"):
+                spec["type"] = low
+            elif low.startswith("amplitude="):
+                d = dim_to_cm(it.split("=", 1)[1])
+                if d is not None:
+                    spec["amplitude"] = d * SCALE
+            elif low.startswith("segment length="):
+                d = dim_to_cm(it.split("=", 1)[1])
+                if d is not None:
+                    spec["seg"] = d * SCALE
+            elif low == "mirror":
+                spec["mirror"] = True
+            elif low.startswith("text="):
+                t = it.split("=", 1)[1].strip()
+                if t.startswith("{") and t.endswith("}"):
+                    t = t[1:-1]
+                spec["text"] = t.replace("|", "")
+    return spec if spec["type"] else None
+
+
+def decorate_path(path: QPainterPath, spec) -> QPainterPath:
+    """Approximate TikZ path-morphing decorations along `path`."""
+    total = path.length()
+    if total < 1e-6:
+        return path
+    A = spec["amplitude"] * (-1 if spec["mirror"] else 1)
+    seg = max(spec["seg"], 2.0)
+    t = spec["type"]
+    if t == "brace":
+        p0 = path.pointAtPercent(0.0)
+        p1 = path.pointAtPercent(1.0)
+        dx, dy = p1.x() - p0.x(), p1.y() - p0.y()
+        L = math.hypot(dx, dy) or 1.0
+        ux, uy = dx / L, dy / L
+        nx, ny = uy, -ux                # normal (left of direction)
+        if spec["mirror"]:
+            nx, ny = -nx, -ny
+        a = abs(spec["amplitude"])
+        mid = QPointF((p0.x() + p1.x()) / 2, (p0.y() + p1.y()) / 2)
+        out = QPainterPath()
+        out.moveTo(p0)
+        out.cubicTo(QPointF(p0.x() + a * nx, p0.y() + a * ny),
+                    QPointF(mid.x() - a * ux * 1.2, mid.y() - a * uy * 1.2),
+                    QPointF(mid.x() + a * nx, mid.y() + a * ny))
+        out.cubicTo(QPointF(mid.x() + a * ux * 1.2, mid.y() + a * uy * 1.2),
+                    QPointF(p1.x() + a * nx, p1.y() + a * ny), p1)
+        return out
+    n = max(int(total / max(seg / 4, 1.5)), 8)
+    pts = []
+    rng_state = int(total * 100) & 0x7fffffff
+    def rnd():
+        nonlocal rng_state
+        rng_state = (1103515245 * rng_state + 12345) & 0x7fffffff
+        return rng_state / 0x7fffffff - 0.5
+    for i in range(n + 1):
+        u = i / n
+        base = path.pointAtPercent(u)
+        ang = math.radians(path.angleAtPercent(min(u, 0.999)))
+        nx, ny = math.sin(ang), math.cos(ang)   # scene normal (y down)
+        d = u * total
+        phase = d / seg * 2 * math.pi
+        if t == "snake":
+            off = math.sin(phase) * A
+        elif t == "zigzag":
+            frac = (d / seg) % 1.0
+            off = (4 * frac - 1 if frac < 0.5 else 3 - 4 * frac) * A
+        elif t == "saw":
+            off = (((d / seg) % 1.0) * 2 - 0) * A if ((d / seg) % 1.0) < 0.999 else 0
+            off = ((d / seg) % 1.0) * A
+        elif t == "coil":
+            off = math.sin(phase) * A
+        elif t == "random steps":
+            off = rnd() * 2 * A
+        else:
+            off = 0
+        if t == "coil":
+            back = math.cos(phase) * A * 0.6
+            ux2, uy2 = math.cos(ang), -math.sin(ang)
+            pts.append(QPointF(base.x() + nx * off - ux2 * back,
+                               base.y() + ny * off - uy2 * back))
+        else:
+            pts.append(QPointF(base.x() + nx * off, base.y() + ny * off))
+    out = QPainterPath()
+    out.moveTo(pts[0])
+    if t in ("random steps", "saw", "zigzag"):
+        for pnt in pts[1:]:
+            out.lineTo(pnt)
+    else:
+        for i in range(1, len(pts)):
+            mid = QPointF((pts[i - 1].x() + pts[i].x()) / 2,
+                          (pts[i - 1].y() + pts[i].y()) / 2)
+            out.quadTo(pts[i - 1], mid)
+        out.lineTo(pts[-1])
+    return out
+
+
+# ----------------------------------------------------------------------
 # arrowheads — each TikZ tip style gets its own visual
 # ----------------------------------------------------------------------
-def _tip_kind(token: str) -> str:
+def _tip_kind(token: str):
+    """Parse one tip token into a spec dict (or None).
+    Supports > < >> << to Stealth Latex {Circle} {Square[open]}
+    {Type[length=..., width=...]}."""
     t = token.strip()
-    if t in ("<", ">"):
-        return "v"
-    tl = t.lower()
-    if tl == "stealth":
-        return "stealth"
-    if tl == "latex":
-        return "latex"
-    return ""
+    if not t:
+        return None
+    spec = {"kind": "", "L": None, "W": None, "open": False}
+    if t.startswith("{") and t.endswith("}"):
+        t = t[1:-1].strip()
+    m = _re.fullmatch(r"([A-Za-z<>| ]+?)\s*(?:\[(.*)\])?", t)
+    if not m:
+        return None
+    name = m.group(1).strip()
+    for o in (m.group(2) or "").split(","):
+        o = o.strip()
+        if o == "open":
+            spec["open"] = True
+        elif o.startswith("length="):
+            from .parser import dim_to_cm
+            d = dim_to_cm(o.split("=", 1)[1])
+            if d is not None:
+                spec["L"] = d * SCALE
+        elif o.startswith("width="):
+            from .parser import dim_to_cm
+            d = dim_to_cm(o.split("=", 1)[1])
+            if d is not None:
+                spec["W"] = d * SCALE / 2
+    kinds = {">": "v", "<": "v", ">>": "vv", "<<": "vv", "to": "v",
+             "stealth": "stealth", "latex": "latex", "circle": "circle",
+             "square": "square", "|": "bar", "bar": "bar"}
+    spec["kind"] = kinds.get(name.lower(), "")
+    return spec if spec["kind"] else None
 
 
-def tip_kinds(arrows: str) -> Tuple[str, str]:
-    """'->' -> ('','v');  '<->' -> ('v','v');  '-Stealth' -> ('','stealth')."""
+def tip_kinds(arrows: str):
+    """Split an arrow spec at the top-level '-' into (left, right) tip
+    specs (either may be None)."""
     a = (arrows or "").strip()
-    if not a or "-" not in a:
-        return "", ""
-    left, right = a.split("-", 1)
-    return _tip_kind(left), _tip_kind(right)
+    if not a:
+        return None, None
+    depth = 0
+    for i, ch in enumerate(a):
+        if ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+        elif ch == "-" and depth == 0:
+            return _tip_kind(a[:i]), _tip_kind(a[i + 1:])
+    return None, None
 
 
-def head_path(kind: str, tip: QPointF, ang: float,
+def head_path(spec, tip: QPointF, ang: float,
               lw: float) -> Tuple[QPainterPath, bool]:
     """Build an arrowhead at scene point `tip` pointing along `ang`
     (radians, scene coords).  Returns (path, filled)."""
-    L = 9 + lw * 4          # length
-    W = 3.5 + lw * 1.6      # half width
+    kind = spec["kind"] if isinstance(spec, dict) else spec
+    L = (spec.get("L") if isinstance(spec, dict) else None) or 9 + lw * 4
+    W = (spec.get("W") if isinstance(spec, dict) else None) or 3.5 + lw * 1.6
+    is_open = isinstance(spec, dict) and spec.get("open")
     ca, sa = math.cos(ang), math.sin(ang)
     px, py = -sa, ca        # perpendicular
     def pt(back, side):
@@ -201,6 +352,28 @@ def head_path(kind: str, tip: QPointF, ang: float,
     p = QPainterPath()
     if kind == "v":                       # classic open tip  ->
         p.moveTo(pt(L, W)); p.lineTo(tip); p.lineTo(pt(L, -W))
+        return p, False
+    if kind == "vv":                      # doubled tip  ->>
+        p.moveTo(pt(L, W)); p.lineTo(tip); p.lineTo(pt(L, -W))
+        off = L * 0.7
+        p.moveTo(pt(L + off, W)); p.lineTo(pt(off, 0))
+        p.lineTo(pt(L + off, -W))
+        return p, False
+    if kind == "circle":                  # -{Circle} / -{Circle[open]}
+        r = W * 1.1
+        p.addEllipse(QPointF(tip.x() - r * ca, tip.y() - r * sa), r, r)
+        return p, not is_open
+    if kind == "square":                  # -{Square} / -{Square[open]}
+        r = W
+        c = QPointF(tip.x() - r * ca, tip.y() - r * sa)
+        p.moveTo(c.x() + r * (ca + px), c.y() + r * (sa + py))
+        p.lineTo(c.x() + r * (ca - px), c.y() + r * (sa - py))
+        p.lineTo(c.x() - r * (ca + px), c.y() - r * (sa + py))
+        p.lineTo(c.x() - r * (ca - px), c.y() - r * (sa - py))
+        p.closeSubpath()
+        return p, not is_open
+    if kind == "bar":                     # -| bar tip
+        p.moveTo(pt(0, W * 1.3)); p.lineTo(pt(0, -W * 1.3))
         return p, False
     if kind == "latex":                   # filled triangle  -Latex
         p.moveTo(tip); p.lineTo(pt(L, W)); p.lineTo(pt(L, -W))
@@ -375,6 +548,10 @@ def node_box(e: NodeEl):
         dy = +h / 2       # scene y grows downward
     if "south" in a:
         dy = -h / 2
+    if e.inner_sep >= 0:
+        pad = e.inner_sep * SCALE
+        w += 2 * pad
+        h += 2 * pad
     rect = QRectF(dx - w / 2, dy - h / 2, w, h)
     return disp, font, rect, flags, fmt.color
 
@@ -493,10 +670,27 @@ class ElementItem(QGraphicsPathItem):
             d_op = pgf.stroke_op
         pen = QPen(qcolor_alpha(stroke, d_op))
         pen.setWidthF(max(lw_pt * 1.6, 1.0))
-        if st.dash == "dashed":
+        if st.dash in ("dashed", "densely dashed", "loosely dashed"):
             pen.setStyle(Qt.PenStyle.DashLine)
-        elif st.dash == "dotted":
+        elif st.dash in ("dotted", "densely dotted", "loosely dotted"):
             pen.setStyle(Qt.PenStyle.DotLine)
+        elif st.dash == "dash dot":
+            pen.setStyle(Qt.PenStyle.DashDotLine)
+        elif st.dash == "dash dot dot":
+            pen.setStyle(Qt.PenStyle.DashDotDotLine)
+        elif st.dash.startswith("dash pattern="):
+            from .parser import dim_to_cm
+            pat = []
+            for mm in _re.finditer(r"(on|off)\s+([\d.]+\s*(?:pt|mm|cm|in)?)",
+                                   st.dash):
+                d = dim_to_cm(mm.group(2))
+                if d is not None:
+                    pw = max(lw_pt * 1.6, 1.0)
+                    pat.append(max(d * SCALE / pw, 0.1))
+            if len(pat) % 2:
+                pat = pat * 2
+            if pat:
+                pen.setDashPattern(pat)
         elif pgf and pgf.dash:
             pw = max(lw_pt * 1.6, 1.0)
             pat = [max(d * PT_PX / pw, 0.1) for d in pgf.dash]
@@ -550,6 +744,9 @@ class ElementItem(QGraphicsPathItem):
             e_draw = dataclasses.replace(e_draw, style=st2)
 
         path = element_path(e_draw, self.canvas)
+        self._deco = decoration_of(st)
+        if self._deco and self._deco["type"] != "text along path":
+            path = decorate_path(path, self._deco)
         if pgf and pgf.eo:
             path.setFillRule(Qt.FillRule.OddEvenFill)
         self.setPath(path)
@@ -681,6 +878,33 @@ class ElementItem(QGraphicsPathItem):
                 painter.setPen(QPen(QColor("gray"), 1, Qt.PenStyle.DashLine))
                 painter.drawRect(r)
                 painter.drawText(r, Qt.AlignmentFlag.AlignCenter, e.name)
+        elif getattr(self, "_deco", None) \
+                and self._deco["type"] == "text along path":
+            path = self.path()
+            txt = latex_to_unicode(self._deco["text"])
+            total = path.length()
+            font = QFont("DejaVu Sans", 9)
+            painter.setFont(font)
+            painter.setPen(QPen(qcolor(e.style.draw or "black")))
+            fm = painter.fontMetrics()
+            d = 2.0
+            for ch in txt:
+                w = fm.horizontalAdvance(ch)
+                if d + w > total:
+                    break
+                u = (d + w / 2) / total
+                pos = path.pointAtPercent(u)
+                ang = -path.angleAtPercent(u)
+                painter.save()
+                painter.translate(pos)
+                painter.rotate(ang)
+                painter.drawText(QPointF(-w / 2, -2), ch)
+                painter.restore()
+                d += w
+            if self.isSelected():
+                painter.setPen(QPen(QColor(30, 120, 255), 1,
+                                    Qt.PenStyle.DashLine))
+                painter.drawPath(path)
         else:
             super().paint(painter, option, widget)
             if getattr(self, "_inner_pen", None) is not None:
@@ -717,21 +941,166 @@ class ElementItem(QGraphicsPathItem):
 
     @staticmethod
     def _node_shape(painter, e, r):
+        cx, cy = r.center().x(), r.center().y()
+        w, h = r.width(), r.height()
+        path = QPainterPath()
         if e.shape == "circle":
-            R = max(r.width(), r.height()) / 2
+            R = max(w, h) / 2
             painter.drawEllipse(r.center(), R, R)
-        elif e.shape == "ellipse":
+            return
+        if e.shape == "ellipse":
             painter.drawEllipse(r)
-        elif e.shape == "diamond":
-            path = QPainterPath()
-            path.moveTo(r.center().x(), r.top() - r.height() * 0.25)
-            path.lineTo(r.right() + r.width() * 0.25, r.center().y())
-            path.lineTo(r.center().x(), r.bottom() + r.height() * 0.25)
-            path.lineTo(r.left() - r.width() * 0.25, r.center().y())
-            path.closeSubpath()
+            return
+        if e.shape == "diamond":
+            path.moveTo(cx, r.top() - h * 0.25)
+            path.lineTo(r.right() + w * 0.25, cy)
+            path.lineTo(cx, r.bottom() + h * 0.25)
+            path.lineTo(r.left() - w * 0.25, cy)
+        elif e.shape == "single arrow":
+            # arrow pointing right (TikZ default orientation)
+            hw = h * 0.28        # shaft half-height
+            hd = min(w * 0.35, h * 0.9)   # head length
+            path.moveTo(r.left(), cy - hw)
+            path.lineTo(r.right() - hd, cy - hw)
+            path.lineTo(r.right() - hd, r.top())
+            path.lineTo(r.right(), cy)
+            path.lineTo(r.right() - hd, r.bottom())
+            path.lineTo(r.right() - hd, cy + hw)
+            path.lineTo(r.left(), cy + hw)
+        elif e.shape == "double arrow":
+            hw = h * 0.28
+            hd = min(w * 0.30, h * 0.9)
+            path.moveTo(r.left(), cy)
+            path.lineTo(r.left() + hd, r.top())
+            path.lineTo(r.left() + hd, cy - hw)
+            path.lineTo(r.right() - hd, cy - hw)
+            path.lineTo(r.right() - hd, r.top())
+            path.lineTo(r.right(), cy)
+            path.lineTo(r.right() - hd, r.bottom())
+            path.lineTo(r.right() - hd, cy + hw)
+            path.lineTo(r.left() + hd, cy + hw)
+            path.lineTo(r.left() + hd, r.bottom())
+        elif e.shape == "star":
+            n = e.star_points or 5
+            R = max(w, h) * 0.62
+            ri = R * 0.45
+            for i in range(2 * n):
+                rad = R if i % 2 == 0 else ri
+                a = -math.pi / 2 + i * math.pi / n
+                pt = QPointF(cx + rad * math.cos(a), cy + rad * math.sin(a))
+                path.moveTo(pt) if i == 0 else path.lineTo(pt)
+        elif e.shape == "starburst":
+            n = 9
+            R = max(w, h) * 0.65
+            ri = R * 0.62
+            for i in range(2 * n):
+                rad = R if i % 2 == 0 else ri
+                a = -math.pi / 2 + i * math.pi / n
+                pt = QPointF(cx + rad * math.cos(a), cy + rad * math.sin(a))
+                path.moveTo(pt) if i == 0 else path.lineTo(pt)
+        elif e.shape == "regular polygon":
+            n = e.poly_sides or 5
+            R = max(w, h) * 0.62
+            for i in range(n):
+                a = -math.pi / 2 + i * 2 * math.pi / n
+                pt = QPointF(cx + R * math.cos(a), cy + R * math.sin(a))
+                path.moveTo(pt) if i == 0 else path.lineTo(pt)
+        elif e.shape == "trapezium":
+            inset = w * 0.22
+            path.moveTo(r.left() - inset, r.bottom())
+            path.lineTo(r.right() + inset, r.bottom())
+            path.lineTo(r.right(), r.top())
+            path.lineTo(r.left(), r.top())
+        elif e.shape == "signal":
+            d = w * 0.25
+            path.moveTo(r.left(), r.top())
+            path.lineTo(r.right() - d, r.top())
+            path.lineTo(r.right(), cy)
+            path.lineTo(r.right() - d, r.bottom())
+            path.lineTo(r.left(), r.bottom())
+            path.lineTo(r.left() + d, cy)
+        elif e.shape == "tape":
+            wav = h * 0.18
+            path.moveTo(r.left(), r.top() + wav)
+            path.cubicTo(r.left() + w * 0.25, r.top() - wav,
+                         r.right() - w * 0.25, r.top() + 2 * wav,
+                         r.right(), r.top() + wav)
+            path.lineTo(r.right(), r.bottom() - wav)
+            path.cubicTo(r.right() - w * 0.25, r.bottom() + wav,
+                         r.left() + w * 0.25, r.bottom() - 2 * wav,
+                         r.left(), r.bottom() - wav)
+        elif e.shape == "cylinder":
+            ry = h * 0.18
+            path.moveTo(r.left(), r.top() + ry)
+            path.lineTo(r.left(), r.bottom() - ry)
+            path.arcTo(r.left(), r.bottom() - 2 * ry, w, 2 * ry, 180, 180)
+            path.lineTo(r.right(), r.top() + ry)
+            path.arcTo(r.left(), r.top(), w, 2 * ry, 0, 180)
             painter.drawPath(path)
+            painter.drawArc(int(r.left()), int(r.top()), int(w),
+                            int(2 * ry), 180 * 16, 180 * 16)
+            return
+        elif e.shape == "kite":
+            path.moveTo(cx, r.top() - h * 0.15)
+            path.lineTo(r.right(), cy - h * 0.1)
+            path.lineTo(cx, r.bottom() + h * 0.35)
+            path.lineTo(r.left(), cy - h * 0.1)
+        elif e.shape == "dart":
+            path.moveTo(cx, r.top() - h * 0.2)
+            path.lineTo(r.right() + w * 0.15, r.bottom() + h * 0.2)
+            path.lineTo(cx, r.bottom() - h * 0.1)
+            path.lineTo(r.left() - w * 0.15, r.bottom() + h * 0.2)
+        elif e.shape in ("ellipse callout", "rectangle callout",
+                         "cloud callout"):
+            # bubble
+            bubble = QPainterPath()
+            if e.shape == "rectangle callout":
+                bubble.addRect(r)
+            elif e.shape == "cloud callout":
+                k = 5
+                for i in range(k):
+                    a = i * 2 * math.pi / k
+                    bubble.addEllipse(
+                        QPointF(cx + w * 0.32 * math.cos(a),
+                                cy + h * 0.32 * math.sin(a)),
+                        w * 0.32, h * 0.32)
+                bubble = bubble.simplified()
+            else:
+                bubble.addEllipse(r.adjusted(-w * 0.12, -h * 0.12,
+                                             w * 0.12, h * 0.12))
+            # pointer wedge towards the target
+            if e.has_ptr:
+                if e.ptr_rel:
+                    tx = cx + e.ptr_x * SCALE
+                    ty = cy - e.ptr_y * SCALE
+                else:
+                    tx = (e.ptr_x - e.x) * SCALE + cx - 0
+                    ty = -(e.ptr_y - e.y) * SCALE + cy - 0
+                dxp, dyp = tx - cx, ty - cy
+                Lp = math.hypot(dxp, dyp) or 1.0
+                nxp, nyp = -dyp / Lp, dxp / Lp
+                base = min(w, h) * 0.18
+                wedge = QPainterPath()
+                wedge.moveTo(cx + nxp * base, cy + nyp * base)
+                wedge.lineTo(tx, ty)
+                wedge.lineTo(cx - nxp * base, cy - nyp * base)
+                wedge.closeSubpath()
+                bubble = bubble.united(wedge)
+            painter.drawPath(bubble)
+            return
+        elif e.shape == "cloud":
+            k = 5
+            for i in range(k):
+                a = i * 2 * math.pi / k
+                bx = cx + w * 0.32 * math.cos(a)
+                by = cy + h * 0.32 * math.sin(a)
+                path.addEllipse(QPointF(bx, by), w * 0.32, h * 0.32)
+            path = path.simplified()
         else:
             painter.drawRect(r)
+            return
+        path.closeSubpath()
+        painter.drawPath(path)
 
     # move -> update model (ALL moved items, not just the grabbed one) -----
     def mouseReleaseEvent(self, ev):
@@ -865,7 +1234,97 @@ class LibraryItem(ElementItem):
             painter.drawRect(self.boundingRect())
 
 
+class PlotRenderer(QThread):
+    done = pyqtSignal(str)          # emits the cache key
+
+    def __init__(self, key, code, preamble_pkgs):
+        super().__init__()
+        self.key, self.code, self.pkgs = key, code, preamble_pkgs
+
+    def run(self):
+        import subprocess, tempfile, shutil as sh
+        from .library import LIB_DIR
+        out_dir = os.path.join(LIB_DIR, "plots")
+        os.makedirs(out_dir, exist_ok=True)
+        wd = tempfile.mkdtemp(prefix="tzsplot_")
+        doc = ("\\documentclass[border=1pt]{standalone}\n"
+               "\\usepackage{pgfplots}\n"
+               "\\pgfplotsset{compat=1.18}\n"
+               + "".join(f"\\usepackage{{{p}}}\n" for p in self.pkgs
+                         if p not in ("pgfplots", "tikz"))
+               + "\\begin{document}\n" + self.code
+               + "\n\\end{document}\n")
+        try:
+            with open(os.path.join(wd, "p.tex"), "w") as f:
+                f.write(doc)
+            r = subprocess.run(
+                ["pdflatex", "-interaction=nonstopmode", "p.tex"],
+                cwd=wd, capture_output=True, text=True, timeout=60)
+            if r.returncode == 0:
+                subprocess.run(
+                    ["pdftocairo", "-png", "-transp", "-singlefile",
+                     "-r", "102", "p.pdf", "plot"],
+                    cwd=wd, capture_output=True, timeout=30)
+                png = os.path.join(wd, "plot.png")
+                if os.path.exists(png):
+                    sh.copy(png, os.path.join(out_dir, self.key + ".png"))
+        except Exception:
+            pass
+        finally:
+            sh.rmtree(wd, ignore_errors=True)
+        self.done.emit(self.key)
+
+
+class AxisItem(ElementItem):
+    """A pgfplots axis rendered by compiling its snippet (cached)."""
+
+    def rebuild(self):
+        import hashlib
+        e: AxisEl = self.element
+        self.setPath(QPainterPath())
+        self.setPen(QPen(Qt.PenStyle.NoPen))
+        self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self._key = hashlib.md5(e.code.encode()).hexdigest()[:16]
+        self._pm = self.canvas.plot_pixmap(self._key, e.code)
+        self.setPos(0, 0)
+        self.setTransform(QTransform())
+        self.prepareGeometryChange()
+
+    def boundingRect(self) -> QRectF:
+        e = self.element
+        c = to_scene(e.x, e.y)
+        if self._pm is not None:
+            w, h = self._pm.width(), self._pm.height()
+        else:
+            w, h = 5 * SCALE, 3.5 * SCALE
+        return QRectF(c.x() - w / 2, c.y() - h / 2, w, h)
+
+    def shape(self):
+        p = QPainterPath()
+        p.addRect(self.boundingRect())
+        return p
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.boundingRect()
+        if self._pm is not None:
+            painter.drawPixmap(r.topLeft(), self._pm)
+        else:
+            painter.setPen(QPen(QColor("#6b7280"), 1, Qt.PenStyle.DashLine))
+            painter.setBrush(QBrush(QColor(240, 244, 248, 180)))
+            painter.drawRect(r)
+            painter.drawText(r, Qt.AlignmentFlag.AlignCenter,
+                             "pgfplots\n(compiling preview…)")
+        if self.isSelected():
+            painter.setPen(QPen(QColor(30, 120, 255), 1,
+                                Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(r)
+
+
 def make_item(e: Element, canvas: "Canvas", pgf=None) -> ElementItem:
+    if isinstance(e, AxisEl):
+        return AxisItem(e, canvas, pgf)
     if isinstance(e, GroupEl):
         return GroupItem(e, canvas, pgf)
     if isinstance(e, LibraryEl):
@@ -901,6 +1360,8 @@ class Canvas(QGraphicsView):
         self.snap = True
         self.show_grid = True
         self.auto_select = True        # revert to Select after drawing
+        self._plot_pms = {}            # key -> QPixmap
+        self._plot_threads = {}        # key -> PlotRenderer
         self.grid_step = 0.5   # cm — visible grid AND snap step
         self.auto_revert = True     # back to Select after drawing (setting)
         self._last_mouse = (0.0, 0.0)   # cm, for paste-at-cursor
@@ -955,6 +1416,36 @@ class Canvas(QGraphicsView):
         return sh.size_cm[0] * SCALE, sh.size_cm[1] * SCALE
 
     # -- tools / figure -------------------------------------------------------
+    def plot_pixmap(self, key, code):
+        """Cached pixmap of a compiled pgfplots snippet, or None while a
+        background render is in flight."""
+        if key in self._plot_pms:
+            return self._plot_pms[key]
+        from .library import LIB_DIR
+        png = os.path.join(LIB_DIR, "plots", key + ".png")
+        if os.path.exists(png):
+            pm = QPixmap(png)
+            # rendered at 102 dpi ≈ 40.16 px/cm; rescale to canvas scale
+            f = SCALE / (102 / 2.54)
+            if abs(f - 1) > 0.01:
+                pm = pm.scaled(round(pm.width() * f),
+                               round(pm.height() * f),
+                               Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+            self._plot_pms[key] = pm
+            return pm
+        if key not in self._plot_threads:
+            pkgs = getattr(self.figure, "_doc_packages", [])
+            th = PlotRenderer(key, code, pkgs)
+            th.done.connect(self._plot_done)
+            self._plot_threads[key] = th
+            th.start()
+        return None
+
+    def _plot_done(self, key):
+        self._plot_threads.pop(key, None)
+        self.rebuild_scene()
+
     def set_partial_select(self, partial: bool):
         self.setRubberBandSelectionMode(
             Qt.ItemSelectionMode.IntersectsItemShape if partial

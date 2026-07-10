@@ -20,12 +20,12 @@ from PyQt6.QtWidgets import (QMainWindow, QToolBar, QDockWidget, QLabel,
                              QSizePolicy)
 from PyQt6.QtGui import QFileSystemModel
 
-from .elements import (TikzDocument, Figure, Style, NodeEl, ImageEl, GridEl,
+from .elements import (AxisEl, TikzDocument, Figure, Style, NodeEl, ImageEl, GridEl,
                        ArcEl, RawEl, LibraryEl, GroupEl, TREE_TEMPLATE,
                        CALLOUT_TEMPLATE)
 from . import library as libmod
 from .library import (REGISTRY, LibraryBuilder, compile_custom,
-                      export_custom, import_custom)
+                      export_bundle, import_bundle)
 from .textformat import parse_format, apply_format, SIZES
 from .parser import parse_body, import_tex
 from .canvas import Canvas, TOOLS
@@ -680,6 +680,7 @@ class MainWindow(QMainWindow):
                                 lambda: self._insert_raw(CALLOUT_TEMPLATE,
                                                          ["shapes.callouts"])))
         ins.addAction(self._act("Image…", None, self._insert_image))
+        ins.addAction(self._act("PGF plot (axis)…", None, self.insert_plot))
 
         b = m.addMenu("&Build")
         b.addAction(self.compile_action)
@@ -717,6 +718,10 @@ class MainWindow(QMainWindow):
     # ==================================================================
     # figures
     # ==================================================================
+    def _sync_doc_meta(self):
+        for f in self.doc.figures:
+            f._doc_packages = list(self.doc.packages)
+
     def fig(self) -> Figure:
         return self.doc.figures[self.current_fig]
 
@@ -823,7 +828,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _element_prop_keys(e):
-        from .elements import (LineEl, RectEl, CircleEl, EllipseEl, PolyEl,
+        from .elements import (AxisEl, LineEl, RectEl, CircleEl, EllipseEl, PolyEl,
                                BezierEl, PlotEl, ArcEl, GridEl, NodeEl,
                                ImageEl, LibraryEl, GroupEl)
         base = {"stroke", "lw", "dash", "op"}
@@ -1649,6 +1654,86 @@ class MainWindow(QMainWindow):
         self.canvas.rebuild_scene()
         self._push_code_to_editor()
 
+
+    PLOT_TEMPLATES = {
+        "Line plot (coordinates)":
+            "\\begin{tikzpicture}\n\\begin{axis}[width=7cm, height=5cm,"
+            " xlabel={$x$}, ylabel={$y$}, grid=major]\n"
+            "\\addplot[blue, thick, mark=*] coordinates "
+            "{(0,1) (1,2) (2,1.5) (3,3) (4,2.5)};\n"
+            "\\end{axis}\n\\end{tikzpicture}",
+        "Function plot":
+            "\\begin{tikzpicture}\n\\begin{axis}[width=7cm, height=5cm,"
+            " xlabel={$x$}, ylabel={$f(x)$}, grid=major, domain=-2:2,"
+            " samples=100]\n"
+            "\\addplot[red, thick] {x^2};\n"
+            "\\addplot[blue, thick, dashed] {exp(x)/3};\n"
+            "\\legend{$x^2$, $e^x/3$}\n"
+            "\\end{axis}\n\\end{tikzpicture}",
+        "Scatter plot":
+            "\\begin{tikzpicture}\n\\begin{axis}[width=7cm, height=5cm,"
+            " xlabel={$x$}, ylabel={$y$}]\n"
+            "\\addplot[only marks, mark=o, blue] coordinates "
+            "{(1,2) (1.5,2.6) (2,1.8) (2.4,3.1) (3,2.2) (3.5,3.6)};\n"
+            "\\end{axis}\n\\end{tikzpicture}",
+        "Bar chart":
+            "\\begin{tikzpicture}\n\\begin{axis}[width=7cm, height=5cm,"
+            " ybar, ylabel={count}, symbolic x coords={A,B,C,D},"
+            " xtick=data, nodes near coords]\n"
+            "\\addplot[fill=blue!40] coordinates "
+            "{(A,4) (B,7) (C,3) (D,6)};\n"
+            "\\end{axis}\n\\end{tikzpicture}",
+    }
+
+    def _ensure_plot_preamble(self):
+        if "pgfplots" not in self.doc.packages:
+            self.doc.packages.append("pgfplots")
+        extra = self.doc.extra_preamble
+        add = []
+        if "\\pgfplotsset{compat=" not in extra:
+            add.append("\\pgfplotsset{compat=1.18}")
+        if "\\newsavebox{\\tzsplot}" not in extra:
+            add.append("\\newsavebox{\\tzsplot}")
+        if add:
+            self.doc.extra_preamble = (extra + "\n" if extra.strip()
+                                       else "") + "\n".join(add)
+
+    def insert_plot(self):
+        from PyQt6.QtWidgets import QDialog, QFormLayout, QDialogButtonBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Insert PGF plot")
+        form = QFormLayout(dlg)
+        combo = QComboBox()
+        combo.addItems(list(self.PLOT_TEMPLATES))
+        form.addRow("Plot type:", combo)
+        hint = QLabel("Inserted as \\sbox{\\tzsplot}{…} + \\node — the "
+                      "recommended way to embed a plot without nested-"
+                      "picture problems.\nThe preamble gets pgfplots, "
+                      "\\pgfplotsset{compat=1.18} and the savebox "
+                      "automatically.\nEdit the axis code freely in the "
+                      "editor; the canvas preview recompiles in the "
+                      "background.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#6b7280; font-size:11px;")
+        form.addRow(hint)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._ensure_plot_preamble()
+        self._sync_doc_meta()
+        el = AxisEl(code=self.PLOT_TEMPLATES[combo.currentText()], x=0, y=0)
+        self.fig().elements.append(el)
+        self.canvas.rebuild_scene()
+        self._push_code_to_editor()
+        self._push_history()
+        self.statusBar().showMessage(
+            "Plot inserted — the canvas preview compiles in the "
+            "background; press F5 for the full PDF.", 6000)
+
     def _insert_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Insert image", self.base_dir or "",
@@ -1665,7 +1750,38 @@ class MainWindow(QMainWindow):
     # ==================================================================
     # compile / export / io
     # ==================================================================
+    SHAPE_LIBS = {"single arrow": "shapes.arrows",
+                  "double arrow": "shapes.arrows",
+                  "star": "shapes.geometric", "diamond": "shapes.geometric",
+                  "regular polygon": "shapes.geometric",
+                  "trapezium": "shapes.geometric",
+                  "cylinder": "shapes.geometric",
+                  "kite": "shapes.geometric", "dart": "shapes.geometric",
+                  "cloud": "shapes.symbols", "signal": "shapes.symbols",
+                  "tape": "shapes.symbols",
+                  "starburst": "shapes.symbols",
+                  "ellipse callout": "shapes.callouts",
+                  "rectangle callout": "shapes.callouts",
+                  "cloud callout": "shapes.callouts",
+                  "snake": "decorations.pathmorphing",
+                  "zigzag": "decorations.pathmorphing",
+                  "random steps": "decorations.pathmorphing",
+                  "saw": "decorations.pathmorphing",
+                  "coil": "decorations.pathmorphing",
+                  "brace": "decorations.pathreplacing",
+                  "text along path": "decorations.text"}
+
+    def _ensure_shape_libs(self):
+        body = "\n".join(f.body_code() for f in self.doc.figures)
+        for shape, libname in self.SHAPE_LIBS.items():
+            if re.search(rf"[\[,{{=]\s*{re.escape(shape)}\s*[,\]}}]",
+                         body) \
+                    and libname not in self.doc.tikz_libraries:
+                self.doc.tikz_libraries.append(libname)
+
     def compile(self):
+        self._ensure_shape_libs()
+        self._sync_doc_meta()
         if any(isinstance(e, ImageEl) for f in self.doc.figures
                for e in f.elements) and "graphicx" not in self.doc.packages:
             self.doc.packages.append("graphicx")

@@ -11,7 +11,7 @@ from typing import List, Optional, Tuple
 from .elements import (Style, Element, LineEl, RectEl, CircleEl, EllipseEl,
                        PolyEl, BezierEl, PlotEl, ArcEl, GridEl, NodeEl,
                        ImageEl, RawEl, LibraryEl, GroupEl, CurveEl, PgfEl,
-                       Figure, TikzDocument)
+                       AxisEl, Figure, TikzDocument)
 
 NUM = r"[-+]?\d*\.?\d+"
 PT = rf"\(\s*({NUM})\s*,\s*({NUM})\s*\)"
@@ -183,12 +183,17 @@ def parse_options(opt: str, style: Style,
             if m:
                 style.tf_sy *= float(m.group(1))
                 continue
-        if it != "-" and re.fullmatch(
-                r"(<|Stealth|Latex|stealth|latex)?-"
-                r"(>|Stealth|Latex|stealth|latex)?", it):
+        TIP = (r"(?:<<|>>|<|>|\|" + ""
+               r"|[Ss]tealth|[Ll]atex|to"
+               r"|\{[A-Za-z][A-Za-z ]*(?:\[[^\]]*\])?\})")
+        if it != "-" and re.fullmatch(rf"{TIP}?-{TIP}?", it):
             style.arrows = it
-        elif low in ("dashed", "dotted", "solid"):
+        elif low in ("dashed", "dotted", "solid", "dash dot",
+                     "dash dot dot", "densely dashed", "densely dotted",
+                     "loosely dashed", "loosely dotted"):
             style.dash = low
+        elif low.startswith("dash pattern="):
+            style.dash = it
         elif low.startswith("color="):
             style.draw = it[6:].strip()
         elif low.startswith("draw=") :
@@ -279,6 +284,16 @@ def _parse_statement(stmt: str) -> Optional[Element]:
                                  scale=xys[3])
         return RawEl(code=s)      # marker but unmatched -> keep verbatim
 
+    if s.startswith("\\sbox{\\tzsplot}"):
+        m = re.fullmatch(
+            r"\\sbox\{\\tzsplot\}\{(?P<code>.*)\}\s*"
+            r"\\node\[inner sep=0pt\] at "
+            rf"\(\s*({NUM})\s*,\s*({NUM})\s*\)\s*"
+            r"\{\\usebox\{\\tzsplot\}\}\s*;?", s, re.S)
+        if m:
+            return AxisEl(code=m.group("code").strip(),
+                          x=float(m.group(2)), y=float(m.group(3)))
+        return RawEl(code=s)
     if s.startswith("\\pgf"):
         return PgfEl(code=s, effect=parse_pgf(s))
     if s.startswith("\\begin{scope}"):
@@ -622,8 +637,38 @@ def _parse_node(s: str) -> Optional[Element]:
         if lo == "draw":
             node.draw_border = True
         elif lo in ("rectangle", "circle", "ellipse", "star",
-                    "diamond", "regular polygon", "cloud"):
+                    "diamond", "regular polygon", "cloud",
+                    "single arrow", "double arrow", "trapezium",
+                    "signal", "tape", "starburst", "cylinder",
+                    "kite", "dart", "ellipse callout",
+                    "rectangle callout", "cloud callout"):
             node.shape = lo
+        elif low.startswith("star points="):
+            try:
+                node.star_points = int(lo.split("=", 1)[1]); continue
+            except ValueError:
+                kept.append(lo)
+        elif low.startswith("regular polygon sides="):
+            try:
+                node.poly_sides = int(lo.split("=", 1)[1]); continue
+            except ValueError:
+                kept.append(lo)
+        elif low.startswith("inner sep="):
+            d = dim_to_cm(lo.split("=", 1)[1])
+            if d is not None:
+                node.inner_sep = d
+            else:
+                kept.append(lo)
+        elif re.fullmatch(
+                rf"callout (absolute|relative) pointer=\{{\(\s*({NUM})"
+                rf"\s*,\s*({NUM})\s*\)\}}", lo):
+            mm = re.fullmatch(
+                rf"callout (absolute|relative) pointer=\{{\(\s*({NUM})"
+                rf"\s*,\s*({NUM})\s*\)\}}", lo)
+            node.has_ptr = True
+            node.ptr_rel = mm.group(1) == "relative"
+            node.ptr_x = float(mm.group(2))
+            node.ptr_y = float(mm.group(3))
         elif low.startswith("anchor="):
             node.anchor = lo.split("=", 1)[1].strip()
         elif low in POSITIONAL:

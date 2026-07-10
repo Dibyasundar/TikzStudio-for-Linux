@@ -242,64 +242,6 @@ REGISTRY = Registry()
 # ----------------------------------------------------------------------
 # Import / export of custom elements
 # ----------------------------------------------------------------------
-def export_custom(path: str, group: str = None):
-    """Write custom elements (optionally one group) to a JSON bundle."""
-    import base64
-    items = []
-    for sh in REGISTRY.shapes.values():
-        if not sh.custom:
-            continue
-        if group and sh.group != group:
-            continue
-        thumb_b64 = ""
-        if sh.thumb and os.path.exists(sh.thumb):
-            with open(sh.thumb, "rb") as f:
-                thumb_b64 = base64.b64encode(f.read()).decode("ascii")
-        items.append({"name": sh.name, "template": sh.template,
-                      "libraries": sh.libraries, "packages": sh.packages,
-                      "group": sh.group, "size_cm": list(sh.size_cm),
-                      "thumb_b64": thumb_b64})
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"tikzstudio_elements": 1, "elements": items}, f, indent=1)
-    return len(items)
-
-
-def import_custom(path: str):
-    """Load a JSON bundle of custom elements. Returns (count, error)."""
-    import base64
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-        items = data["elements"]
-        assert data.get("tikzstudio_elements") == 1
-    except (OSError, json.JSONDecodeError, KeyError, AssertionError) as e:
-        return 0, f"Not a TikZ Studio element bundle: {e}"
-    os.makedirs(LIB_DIR, exist_ok=True)
-    n = 0
-    for it in items:
-        try:
-            thumb = ""
-            if it.get("thumb_b64"):
-                safe = "custom_" + re.sub(r"[^a-z0-9]+", "_",
-                                          it["name"].lower())
-                thumb = os.path.join(LIB_DIR, f"{safe}.png")
-                with open(thumb, "wb") as f:
-                    f.write(base64.b64decode(it["thumb_b64"]))
-            REGISTRY.add(LibShape(
-                it["name"], it.get("libraries", []), it["template"],
-                thumb, tuple(it.get("size_cm", (1, 1))), custom=True,
-                packages=it.get("packages", []),
-                group=it.get("group", "My elements")))
-            n += 1
-        except (KeyError, OSError, ValueError):
-            continue
-    REGISTRY.save()
-    return n, ""
-
-
-# ----------------------------------------------------------------------
-# Compilation helpers
-# ----------------------------------------------------------------------
 def _preamble(libraries, packages=None):
     lines = ["\\documentclass[tikz,border=1.5pt]{standalone}"]
     for p in packages or []:

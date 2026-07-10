@@ -1,7 +1,6 @@
 **This project aims to develop a native Linux interface inspired by TikZedit. Please note that the majority of the codebase was generated using Claude's Fabel AI model. The software is currently under active development and is provided "as is," so please use it at your own discretion. We anticipate rolling out new version releases in the near future.**
 
 
-
 # TikZ Studio
 
 A WYSIWYG desktop editor for TikZ/LaTeX diagrams on Linux, with **live
@@ -10,7 +9,7 @@ two-way synchronization** between a visual canvas and the TikZ source code.
 ## Install (Debian/Ubuntu)
 
 ```bash
-sudo apt install ./tikzstudio_1.7.1_all.deb
+sudo apt install ./tikzstudio_1.8.0_all.deb
 ```
 
 This pulls in the dependencies automatically: `python3-pyqt6`,
@@ -42,6 +41,29 @@ Launch from the application menu (**TikZ Studio**) or run `tikzstudio`.
   appears in the palette permanently (marked ★).
 
 **Visual canvas (left/center)**
+- **pgfplots**: *Insert ▸ PGF plot (axis)…* offers line, function,
+  scatter and bar templates, inserted as `\sbox{\tzsplot}{…}` +
+  `\node` (the recommended embedding that avoids nested-picture
+  problems). The preamble automatically gets `pgfplots`,
+  `\pgfplotsset{compat=1.18}` and the savebox. The canvas shows a
+  real compiled preview (rendered in the background and cached); edit
+  the axis code freely and the preview recompiles.
+- **Decorations rendered**: `decorate, decoration={…}` with snake,
+  zigzag, saw, coil, random steps (amplitude / segment length), brace
+  (amplitude, mirror) and text along path (`text={…}`) are drawn on
+  the canvas, not just compiled.
+- **More node shapes**: cylinder, kite, dart, and callouts (ellipse /
+  rectangle / cloud callout with `callout [absolute|relative]
+  pointer={(x,y)}` drawn as a bubble + pointer wedge); `star points=`,
+  `regular polygon sides=`, `inner sep=` all parsed, rendered and
+  round-tripped. Required TikZ libraries (shapes.*, decorations.*,
+  callouts) are added to the preamble automatically at compile time.
+- **Full dash grammar**: dash dot, dash dot dot, densely/loosely
+  variants, and `dash pattern=on X off Y …` rendered with true custom
+  patterns.
+- **arrows.meta tips**: `->>`, `-{Circle}`, `-{Square[open]}` and
+  custom `-{Tip[length=…, width=…]}` parse, render with correct
+  open/filled looks and sizes, and round-trip.
 - **Whole-element multi-select**: the rubber band selects only elements
   fully inside it (no accidental partial grabs); the Properties panel
   bulk-edits everything selected.
@@ -252,7 +274,6 @@ tikzstudio/
   dialogs.py    package/library manager
   app.py        main window
 ```
-
 
 
 ## Screenshot of UI

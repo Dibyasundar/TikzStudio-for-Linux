@@ -56,7 +56,7 @@ class Style:
             o.append(f"fill={self.fill}")
         if abs(self.line_width - 0.4) > 1e-9:
             o.append(f"line width={fnum(self.line_width)}pt")
-        if self.dash in ("dashed", "dotted"):
+        if self.dash and self.dash != "solid":
             o.append(self.dash)
         if self.opacity < 0.999:
             o.append(f"opacity={fnum(self.opacity)}")
@@ -380,6 +380,13 @@ class NodeEl(Element):
     x: float = 0; y: float = 0
     text: str = "text"
     shape: str = ""          # "", rectangle, circle, ellipse, star, ...
+    star_points: int = 0     # star points= (0 = default 5)
+    poly_sides: int = 0      # regular polygon sides=
+    inner_sep: float = -1.0  # cm; <0 = TikZ default
+    has_ptr: bool = False    # callout pointer
+    ptr_rel: bool = False
+    ptr_x: float = 0.0
+    ptr_y: float = 0.0
     draw_border: bool = False
     anchor: str = ""         # west, north east, ...
     scale: float = 1.0
@@ -393,6 +400,16 @@ class NodeEl(Element):
         extra = []
         if self.shape:
             extra.append(self.shape)
+        if self.star_points:
+            extra.append(f"star points={self.star_points}")
+        if self.poly_sides:
+            extra.append(f"regular polygon sides={self.poly_sides}")
+        if self.has_ptr:
+            kind = "relative" if self.ptr_rel else "absolute"
+            extra.append(f"callout {kind} pointer="
+                         f"{{({fnum(self.ptr_x)},{fnum(self.ptr_y)})}}")
+        if self.inner_sep >= 0:
+            extra.append(f"inner sep={fnum(self.inner_sep)}cm")
         if self.draw_border or self.shape:
             extra.append("draw")
         if self.anchor:
@@ -552,6 +569,28 @@ def catmull_to_curve(pts, style=None):
                      pts[i][0], pts[i][1]])
     return CurveEl(style=style or Style(), x0=pts[0][0], y0=pts[0][1],
                    segs=segs)
+
+
+@dataclass
+class AxisEl(Element):
+    """A pgfplots axis (or any picture) kept in a \\savebox and shown
+    as a node — the recommended way to embed a plot without nested-
+    picture problems.  Rendered on the canvas by compiling the snippet
+    in the background."""
+    code: str = ""           # \\begin{tikzpicture}...\\end{tikzpicture}
+    x: float = 0; y: float = 0
+
+    def to_tikz(self):
+        return (f"\\sbox{{\\tzsplot}}{{{self.code}}}\n"
+                f"\\node[inner sep=0pt] at ({fnum(self.x)},{fnum(self.y)})"
+                f" {{\\usebox{{\\tzsplot}}}};")
+
+    def translate(self, dx, dy):
+        self.x += dx; self.y += dy
+
+    def bake(self, s, dx, dy):
+        self.x = dx + s * self.x; self.y = dy + s * self.y
+        return abs(s - 1) < 1e-9
 
 
 @dataclass
