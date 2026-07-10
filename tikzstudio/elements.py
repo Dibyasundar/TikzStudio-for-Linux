@@ -462,14 +462,28 @@ class ImageEl(Element):
 
 @dataclass
 class LibraryEl(Element):
-    """An element placed from the pre-compiled library palette."""
+    """An element placed from the pre-compiled library palette.
+
+    Its snippet is redrawn as vector children on the canvas.  With a
+    rotation or scale it is emitted wrapped in a transforming scope."""
     name: str = ""
     template: str = ""     # contains @X@ / @Y@ anchor placeholders
     x: float = 0; y: float = 0
+    rotate: float = 0.0
+    scale: float = 1.0
 
     def to_tikz(self):
-        return (self.template.replace("@X@", fnum(self.x))
-                .replace("@Y@", fnum(self.y)) + f" % lib:{self.name}")
+        if abs(self.rotate) < 1e-9 and abs(self.scale - 1) < 1e-9:
+            return (self.template.replace("@X@", fnum(self.x))
+                    .replace("@Y@", fnum(self.y)) + f" % lib:{self.name}")
+        inner = self.template.replace("@X@", "0").replace("@Y@", "0")
+        opts = [f"shift={{({fnum(self.x)},{fnum(self.y)})}}"]
+        if abs(self.rotate) > 1e-9:
+            opts.append(f"rotate={fnum(self.rotate)}")
+        if abs(self.scale - 1) > 1e-9:
+            opts.append(f"scale={fnum(self.scale)}")
+        return (f"\\begin{{scope}}[{', '.join(opts)}]\n{inner}\n"
+                f"\\end{{scope}} % lib:{self.name}")
 
     def translate(self, dx, dy):
         self.x += dx; self.y += dy

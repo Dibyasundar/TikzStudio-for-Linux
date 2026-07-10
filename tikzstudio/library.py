@@ -17,6 +17,7 @@ placeholders @X@ and @Y@.  Generated code carries a trailing
 its template, it simply degrades to raw TikZ and still compiles.
 """
 
+import base64
 import json
 import os
 import re
@@ -26,10 +27,23 @@ import subprocess
 from PyQt6.QtCore import QObject, pyqtSignal
 
 NUM = r"[-+]?\d*\.?\d+"
-CACHE_DIR = os.path.join(
-    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+# custom elements & thumbnails live under XDG data (not cache) so they
+# survive app updates and cache cleaning
+DATA_DIR = os.path.join(
+    os.environ.get("XDG_DATA_HOME",
+                   os.path.expanduser("~/.local/share")),
     "tikzstudio")
-LIB_DIR = os.path.join(CACHE_DIR, "library")
+LIB_DIR = os.path.join(DATA_DIR, "library")
+CUSTOM_JSON = os.path.join(LIB_DIR, "custom_elements.json")
+CACHE_DIR = DATA_DIR   # legacy alias
+_OLD_LIB = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+    "tikzstudio", "library")
+if not os.path.isdir(LIB_DIR) and os.path.isdir(_OLD_LIB):
+    try:
+        shutil.copytree(_OLD_LIB, LIB_DIR)
+    except OSError:
+        pass
 THUMB_DPI = 110
 PX_PER_CM = THUMB_DPI / 2.54
 
@@ -140,6 +154,22 @@ class LibShape:
         return (self.template.replace("@X@", fnum(x)).replace("@Y@", fnum(y))
                 + f" % lib:{self.name}")
 
+    def match_scoped(self, stmt: str):
+        """Match the scope-wrapped (rotated/scaled) placement form.
+        Returns (x, y, rotate, scale) or None."""
+        inner = self.template.replace("@X@", "0").replace("@Y@", "0")
+        body = (re.escape(inner).replace(r"\ ", r"\s+")
+                .replace("\\\n", r"\s*"))
+        pat = (r"\\begin\{scope\}\[shift=\{\((" + NUM + r"),(" + NUM
+               + r")\)\}(?:,\s*rotate=(" + NUM + r"))?"
+               + r"(?:,\s*scale=(" + NUM + r"))?\]\s*"
+               + body + r"\s*\\end\{scope\}")
+        m = re.fullmatch(pat, stmt.strip(), re.S)
+        if not m:
+            return None
+        return (float(m.group(1)), float(m.group(2)),
+                float(m.group(3) or 0.0), float(m.group(4) or 1.0))
+
     def match(self, stmt: str):
         """Return (x, y) if `stmt` (marker stripped) matches the template."""
         if self._rx is None:
@@ -171,34 +201,100 @@ class Registry:
         self.shapes[shape.name] = shape
 
     # persistence ----------------------------------------------------------
-    def load(self):
-        path = os.path.join(LIB_DIR, "library.json")
-        if not os.path.exists(path):
-            return False
+    def _load_file(self, path):
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            for d in data:
-                if d.get("thumb") and not os.path.exists(d["thumb"]):
-                    d["thumb"] = ""
+        except (json.JSONDecodeError, OSError):
+            return
+        for d in data:
+            if d.get("thumb") and not os.path.exists(d["thumb"]):
+                d["thumb"] = ""
+            try:
                 sh = LibShape(**d)
-                # migrate caches created before element groups existed
-                if not sh.custom and sh.group in ("", "Other") \
-                        and sh.name in CATEGORIES:
-                    sh.group = CATEGORIES[sh.name]
-                self.add(sh)
-            return bool(self.shapes)
-        except (json.JSONDecodeError, TypeError, OSError):
-            return False
+            except TypeError:
+                continue
+            if not sh.custom and sh.group in ("", "Other") \
+                    and sh.name in CATEGORIES:
+                sh.group = CATEGORIES[sh.name]
+            self.add(sh)
+
+    def load(self):
+        self._load_file(os.path.join(LIB_DIR, "library.json"))
+        self._load_file(CUSTOM_JSON)
+        return bool(self.shapes)
 
     def save(self):
         os.makedirs(LIB_DIR, exist_ok=True)
+        builtins = [s.to_json() for s in self.shapes.values()
+                    if not s.custom]
+        customs = [s.to_json() for s in self.shapes.values() if s.custom]
         with open(os.path.join(LIB_DIR, "library.json"), "w",
                   encoding="utf-8") as f:
-            json.dump([s.to_json() for s in self.shapes.values()], f, indent=1)
+            json.dump(builtins, f, indent=1)
+        with open(CUSTOM_JSON, "w", encoding="utf-8") as f:
+            json.dump(customs, f, indent=1)
 
 
 REGISTRY = Registry()
+
+
+# ----------------------------------------------------------------------
+# Import / export of custom elements
+# ----------------------------------------------------------------------
+def export_custom(path: str, group: str = None):
+    """Write custom elements (optionally one group) to a JSON bundle."""
+    import base64
+    items = []
+    for sh in REGISTRY.shapes.values():
+        if not sh.custom:
+            continue
+        if group and sh.group != group:
+            continue
+        thumb_b64 = ""
+        if sh.thumb and os.path.exists(sh.thumb):
+            with open(sh.thumb, "rb") as f:
+                thumb_b64 = base64.b64encode(f.read()).decode("ascii")
+        items.append({"name": sh.name, "template": sh.template,
+                      "libraries": sh.libraries, "packages": sh.packages,
+                      "group": sh.group, "size_cm": list(sh.size_cm),
+                      "thumb_b64": thumb_b64})
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"tikzstudio_elements": 1, "elements": items}, f, indent=1)
+    return len(items)
+
+
+def import_custom(path: str):
+    """Load a JSON bundle of custom elements. Returns (count, error)."""
+    import base64
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        items = data["elements"]
+        assert data.get("tikzstudio_elements") == 1
+    except (OSError, json.JSONDecodeError, KeyError, AssertionError) as e:
+        return 0, f"Not a TikZ Studio element bundle: {e}"
+    os.makedirs(LIB_DIR, exist_ok=True)
+    n = 0
+    for it in items:
+        try:
+            thumb = ""
+            if it.get("thumb_b64"):
+                safe = "custom_" + re.sub(r"[^a-z0-9]+", "_",
+                                          it["name"].lower())
+                thumb = os.path.join(LIB_DIR, f"{safe}.png")
+                with open(thumb, "wb") as f:
+                    f.write(base64.b64decode(it["thumb_b64"]))
+            REGISTRY.add(LibShape(
+                it["name"], it.get("libraries", []), it["template"],
+                thumb, tuple(it.get("size_cm", (1, 1))), custom=True,
+                packages=it.get("packages", []),
+                group=it.get("group", "My elements")))
+            n += 1
+        except (KeyError, OSError, ValueError):
+            continue
+    REGISTRY.save()
+    return n, ""
 
 
 # ----------------------------------------------------------------------
@@ -320,6 +416,63 @@ def compile_custom(name, code, libraries, packages, extra_preamble="",
     return LibShape(name, libraries, code, dest, size_cm,
                     custom=True, packages=packages,
                     group=group or "My elements"), ""
+
+
+# ----------------------------------------------------------------------
+# Import / export of custom element bundles
+# ----------------------------------------------------------------------
+def export_bundle(path, shapes):
+    """Write custom elements (with embedded thumbnails) to a .tikzlib."""
+    data = []
+    for sh in shapes:
+        d = sh.to_json()
+        if sh.thumb and os.path.exists(sh.thumb):
+            with open(sh.thumb, "rb") as f:
+                d["thumb_b64"] = base64.b64encode(f.read()).decode()
+        d["thumb"] = ""
+        data.append(d)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"tikzstudio_elements": 1, "shapes": data}, f, indent=1)
+    return len(data)
+
+
+def import_bundle(path):
+    """Load a .tikzlib bundle into the registry. Returns (added, skipped)."""
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or "shapes" not in data:
+        raise ValueError("Not a TikZ Studio element bundle.")
+    os.makedirs(LIB_DIR, exist_ok=True)
+    added, skipped = [], []
+    for d in data["shapes"]:
+        b64 = d.pop("thumb_b64", "")
+        name = d.get("name", "")
+        existing = REGISTRY.get(name)
+        if existing is not None:
+            if existing.template == d.get("template"):
+                skipped.append(name)
+                continue
+            i = 2
+            while REGISTRY.get(f"{name} ({i})") is not None:
+                i += 1
+            name = f"{name} ({i})"
+            d["name"] = name
+        d["custom"] = True
+        d["thumb"] = ""
+        if b64:
+            safe = "custom_" + re.sub(r"[^a-z0-9]+", "_", name.lower())
+            dest = os.path.join(LIB_DIR, f"{safe}.png")
+            with open(dest, "wb") as f:
+                f.write(base64.b64decode(b64))
+            d["thumb"] = dest
+        try:
+            REGISTRY.add(LibShape(**d))
+            added.append(name)
+        except TypeError:
+            skipped.append(name)
+    if added:
+        REGISTRY.save()
+    return added, skipped
 
 
 # ----------------------------------------------------------------------

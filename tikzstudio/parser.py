@@ -42,9 +42,20 @@ def split_statements(body: str) -> List[str]:
             i = j
             continue
         if body.startswith("\\begin{scope}", i) and not cur.strip():
-            j = body.find("\\end{scope}", i)
-            if j != -1:
-                j += len("\\end{scope}")
+            # find the MATCHING \\end{scope} (scopes can nest)
+            depth_s, j = 0, i
+            while j < n:
+                if body.startswith("\\begin{scope}", j):
+                    depth_s += 1
+                    j += 13
+                elif body.startswith("\\end{scope}", j):
+                    depth_s -= 1
+                    j += 11
+                    if depth_s == 0:
+                        break
+                else:
+                    j += 1
+            if depth_s == 0 and j <= n:
                 stmt = body[i:j]
                 i = j
                 # trailing comment?
@@ -261,6 +272,11 @@ def _parse_statement(stmt: str) -> Optional[Element]:
             if xy is not None:
                 return LibraryEl(name=shape.name, template=shape.template,
                                  x=xy[0], y=xy[1])
+            xys = shape.match_scoped(m.group(1))
+            if xys is not None:
+                return LibraryEl(name=shape.name, template=shape.template,
+                                 x=xys[0], y=xys[1], rotate=xys[2],
+                                 scale=xys[3])
         return RawEl(code=s)      # marker but unmatched -> keep verbatim
 
     if s.startswith("\\pgf"):

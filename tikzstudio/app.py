@@ -5,7 +5,7 @@ import re
 import shutil
 import subprocess
 
-from PyQt6.QtCore import Qt, QTimer, QThread, QSize
+from PyQt6.QtCore import Qt, QTimer, QThread, QSize, QSettings, QSettings
 from PyQt6.QtGui import (QAction, QKeySequence, QPixmap, QColor,
                          QActionGroup, QIcon, QPainter, QFont)
 from PyQt6.QtWidgets import (QMainWindow, QToolBar, QDockWidget, QLabel,
@@ -24,7 +24,8 @@ from .elements import (TikzDocument, Figure, Style, NodeEl, ImageEl, GridEl,
                        ArcEl, RawEl, LibraryEl, GroupEl, TREE_TEMPLATE,
                        CALLOUT_TEMPLATE)
 from . import library as libmod
-from .library import REGISTRY, LibraryBuilder, compile_custom
+from .library import (REGISTRY, LibraryBuilder, compile_custom,
+                      export_custom, import_custom)
 from .textformat import parse_format, apply_format, SIZES
 from .parser import parse_body, import_tex
 from .canvas import Canvas, TOOLS
@@ -124,10 +125,12 @@ class MainWindow(QMainWindow):
         outer.addWidget(self.right_arrow)
         self.setCentralWidget(central)
 
+        self.settings = QSettings("TikZStudio", "TikZStudio")
         self._build_toolbar()
         self._build_panels()
         self._build_menus()
         self._init_library()
+        self._load_settings()
         self._update_file_label()
         self._refresh_fig_tabs()
         self._push_code_to_editor()
@@ -355,6 +358,50 @@ class MainWindow(QMainWindow):
         self.zoom_label.setText(f"{round(self._pv_zoom * 100)}%")
         self._show_page(self.page_combo.currentIndex())
 
+    def _load_settings(self):
+        st = self.settings
+        auto_sel = st.value("auto_select", True, type=bool)
+        partial = st.value("partial_select", False, type=bool)
+        grid = st.value("grid_step", 0.5, type=float)
+        snap = st.value("snap", True, type=bool)
+        autoc = st.value("auto_compile", False, type=bool)
+        self.canvas.auto_select = auto_sel
+        self.canvas.set_partial_select(partial)
+        self.canvas.snap = snap
+        self.grid_spin.setValue(grid)
+        self.auto_cb.setChecked(autoc)
+        self.act_auto_select.setChecked(auto_sel)
+        self.act_partial.setChecked(partial)
+
+    def _save_settings(self):
+        st = self.settings
+        st.setValue("auto_select", self.canvas.auto_select)
+        st.setValue("partial_select",
+                    self.act_partial.isChecked())
+        st.setValue("grid_step", self.grid_spin.value())
+        st.setValue("snap", self.canvas.snap)
+        st.setValue("auto_compile", self.auto_cb.isChecked())
+        st.sync()
+
+    def closeEvent(self, ev):
+        self._save_settings()
+        super().closeEvent(ev)
+
+    def _toggle_auto_select(self, checked):
+        self.canvas.auto_select = checked
+        self._save_settings()
+        self.statusBar().showMessage(
+            "Auto-revert to Select tool " + ("ON" if checked else
+            "OFF — the drawing tool stays active"), 4000)
+
+    def _toggle_partial(self, checked):
+        self.canvas.set_partial_select(checked)
+        self._save_settings()
+        self.statusBar().showMessage(
+            "Rubber-band selection: " +
+            ("PARTIAL — touching an element selects it" if checked
+             else "WHOLE — only elements fully inside are selected"), 5000)
+
     def _tool_changed_ui(self, tool):
         if tool in self.tool_actions:
             self.tool_actions[tool].setChecked(True)
@@ -368,6 +415,8 @@ class MainWindow(QMainWindow):
     def _set_grid_step(self, v):
         self.canvas.grid_step = v
         self.canvas.viewport().update()
+        if hasattr(self, "settings"):
+            self.settings.setValue("grid_step", v)
         self.statusBar().showMessage(
             f"Grid / snap step: {v:g} cm", 3000)
 
@@ -489,6 +538,26 @@ class MainWindow(QMainWindow):
         self.p_imgh.setToolTip("graphicx height= (0 = auto from width)")
         self.p_imgh.valueChanged.connect(lambda v: self._set_attr("height", v))
         _row("imgh", "Image height", self.p_imgh)
+        self.p_rot = QDoubleSpinBox(); self.p_rot.setRange(-360, 360)
+        self.p_rot.setToolTip("Rotation — nodes/library elements rotate "
+                              "in place; paths get a [rotate=] transform")
+        self.p_rot.valueChanged.connect(
+            lambda v: self._set_transform("rot", v))
+        _row("rot", "Rotate °", self.p_rot)
+        self.p_sclx = QDoubleSpinBox(); self.p_sclx.setRange(-20, 20)
+        self.p_sclx.setValue(1.0); self.p_sclx.setSingleStep(0.1)
+        self.p_sclx.setToolTip("Scale — uniform for nodes and library "
+                               "elements; xscale for paths")
+        self.p_sclx.valueChanged.connect(
+            lambda v: self._set_transform("sx", v))
+        _row("sclx", "Scale / xscale", self.p_sclx)
+        self.p_scly = QDoubleSpinBox(); self.p_scly.setRange(-20, 20)
+        self.p_scly.setValue(1.0); self.p_scly.setSingleStep(0.1)
+        self.p_scly.setToolTip("yscale for path elements (negative "
+                               "mirrors)")
+        self.p_scly.valueChanged.connect(
+            lambda v: self._set_transform("sy", v))
+        _row("scly", "yscale", self.p_scly)
         self.p_scale = QDoubleSpinBox(); self.p_scale.setRange(0.05, 20)
         self.p_scale.setSingleStep(0.1); self.p_scale.setValue(1.0)
         self.p_scale.setToolTip("Scale of the selected scope group")
@@ -573,6 +642,11 @@ class MainWindow(QMainWindow):
         e.addAction(self._act("Undo", "Ctrl+Z", self.undo))
         e.addAction(self._act("Redo", "Ctrl+Shift+Z", self.redo))
         e.addSeparator()
+        e.addAction(self._act("Copy elements", "Ctrl+Shift+C", self._copy))
+        e.addAction(self._act("Cut elements", "Ctrl+Shift+X", self._cut))
+        e.addAction(self._act("Paste at cursor", "Ctrl+Shift+V",
+                              self._paste))
+        e.addSeparator()
         e.addAction(self._act("Comment lines (editor)", "Ctrl+T",
                               lambda: self.editor._comment_selection(True)))
         e.addAction(self._act("Uncomment lines (editor)", "Ctrl+R",
@@ -609,6 +683,26 @@ class MainWindow(QMainWindow):
 
         b = m.addMenu("&Build")
         b.addAction(self.compile_action)
+
+        sm = m.addMenu("&Settings")
+        self.act_auto_select = QAction(
+            "Auto-revert to Select tool after drawing", self)
+        self.act_auto_select.setCheckable(True)
+        self.act_auto_select.setChecked(True)
+        self.act_auto_select.toggled.connect(self._toggle_auto_select)
+        sm.addAction(self.act_auto_select)
+        self.act_partial = QAction(
+            "Partial selection (rubber band selects touched elements)",
+            self)
+        self.act_partial.setCheckable(True)
+        self.act_partial.toggled.connect(self._toggle_partial)
+        sm.addAction(self.act_partial)
+        sm.addSeparator()
+        info_act = self._act(
+            "Settings, custom elements and groups are stored in your home "
+            "folder and survive app updates", None, lambda: None)
+        info_act.setEnabled(False)
+        sm.addAction(info_act)
 
         h = m.addMenu("&Help")
         h.addAction(self._act("About", None, self._about))
@@ -735,6 +829,9 @@ class MainWindow(QMainWindow):
         base = {"stroke", "lw", "dash", "op"}
         closed = base | {"fill", "fop"}
         from .elements import CurveEl as _CurveEl
+        tf = {"rot", "sclx", "scly"}
+        base = base | tf
+        closed = closed | tf
         if isinstance(e, (LineEl, BezierEl, _CurveEl)):
             return base | {"arrow"}
         if isinstance(e, PlotEl):
@@ -748,11 +845,11 @@ class MainWindow(QMainWindow):
         if isinstance(e, GridEl):
             return base | {"step"}
         if isinstance(e, NodeEl):
-            return closed | {"tfmt", "tsize"}
+            return (closed - {"scly"}) | {"tfmt", "tsize"}
         if isinstance(e, ImageEl):
             return {"op", "imgw", "imgh"}
         if isinstance(e, LibraryEl):
-            return {"op"}
+            return {"op", "rot", "sclx"}
         if isinstance(e, GroupEl):
             return {"gscale", "grot", "gxs", "gys"}
         return set()
@@ -772,6 +869,34 @@ class MainWindow(QMainWindow):
             self._push_code_to_editor()
             self._push_history()
         self._paint_color_buttons(targets[0])
+
+    def _set_transform(self, which, v):
+        if self._syncing:
+            return
+        changed = False
+        for el in self._selected():
+            if isinstance(el, GroupEl):
+                continue                      # groups have their own rows
+            if isinstance(el, (NodeEl, LibraryEl)):
+                if which == "rot":
+                    el.rotate = v
+                elif which == "sx":
+                    el.scale = v
+                else:
+                    continue
+            elif hasattr(el, "style"):
+                st = el.style
+                if which == "rot":
+                    st.tf_rot = v
+                elif which == "sx":
+                    st.tf_sx = v
+                else:
+                    st.tf_sy = v
+            changed = True
+        if changed:
+            self.canvas.refresh_selected()
+            self._push_code_to_editor()
+            self._push_history()
 
     def _set_attr(self, attr, value):
         if self._syncing:
@@ -844,9 +969,10 @@ class MainWindow(QMainWindow):
         self.p_arrow.setCurrentText(st.arrows)
         self.p_op.setValue(st.opacity)
         self.p_fop.setValue(st.fill_opacity)
-        is_node = isinstance(element, NodeEl)
+        nodes = [e for e in sel if isinstance(e, NodeEl)]
+        is_node = bool(nodes) and len(nodes) == len(sel)
         if is_node:
-            fmt = parse_format(element.text)
+            fmt = parse_format(nodes[0].text)
             self.p_bold.setChecked(fmt.bold)
             self.p_italic.setChecked(fmt.italic)
             self.p_under.setChecked(fmt.underline)
@@ -859,6 +985,14 @@ class MainWindow(QMainWindow):
         if isinstance(element, ImageEl):
             self.p_imgw.setValue(element.width)
             self.p_imgh.setValue(element.height)
+        if isinstance(element, (NodeEl, LibraryEl)):
+            self.p_rot.setValue(element.rotate)
+            self.p_sclx.setValue(element.scale)
+            self.p_scly.setValue(1.0)
+        elif element is not None and hasattr(element, "style"):
+            self.p_rot.setValue(element.style.tf_rot)
+            self.p_sclx.setValue(element.style.tf_sx)
+            self.p_scly.setValue(element.style.tf_sy)
         if isinstance(element, GroupEl):
             self.p_scale.setValue(element.s)
             self.p_grot.setValue(element.rot)
@@ -952,35 +1086,36 @@ class MainWindow(QMainWindow):
     # ==================================================================
     # node text formatting (bold / italic / underline / colour / size)
     # ==================================================================
-    def _selected_node(self):
-        sel = self.canvas.selected_elements()
-        return sel[0] if len(sel) == 1 and isinstance(sel[0], NodeEl) else None
+    def _selected_nodes(self):
+        return [e for e in self.canvas.selected_elements()
+                if isinstance(e, NodeEl)]
 
     def _apply_text_format(self):
         if self._syncing:
             return
-        n = self._selected_node()
-        if n is None:
+        nodes = self._selected_nodes()
+        if not nodes:
             return
-        fmt = parse_format(n.text)
-        fmt.bold = self.p_bold.isChecked()
-        fmt.italic = self.p_italic.isChecked()
-        fmt.underline = self.p_under.isChecked()
-        fmt.size = self.p_tsize.currentText()
-        n.text = apply_format(fmt)
+        for n in nodes:                       # bulk: every selected node
+            fmt = parse_format(n.text)
+            fmt.bold = self.p_bold.isChecked()
+            fmt.italic = self.p_italic.isChecked()
+            fmt.underline = self.p_under.isChecked()
+            fmt.size = self.p_tsize.currentText()
+            n.text = apply_format(fmt)
         self.canvas.refresh_selected()
         self._push_code_to_editor()
         self._push_history()
 
     def _pick_text_color(self):
-        n = self._selected_node()
-        if n is None:
+        nodes = self._selected_nodes()
+        if not nodes:
             self.statusBar().showMessage(
-                "Select a text node to set its colour.", 3000)
+                "Select one or more text nodes to set their colour.", 3000)
             return
-        fmt = parse_format(n.text)
-        c = QColorDialog.getColor(QColor(fmt.color.split("!")[0])
-                                  if fmt.color else QColor("black"), self)
+        fmt0 = parse_format(nodes[0].text)
+        c = QColorDialog.getColor(QColor(fmt0.color.split("!")[0])
+                                  if fmt0.color else QColor("black"), self)
         if not c.isValid():
             return
         named = {"#000000": "", "#ff0000": "red", "#00ff00": "green",
@@ -988,10 +1123,13 @@ class MainWindow(QMainWindow):
                  "#ffff00": "yellow", "#00ffff": "cyan",
                  "#ff00ff": "magenta", "#ff8000": "orange",
                  "#808080": "gray"}
-        fmt.color = named.get(
+        col = named.get(
             c.name(),
             f"{{rgb,255:red,{c.red()};green,{c.green()};blue,{c.blue()}}}")
-        n.text = apply_format(fmt)
+        for n in nodes:                       # bulk colour
+            fmt = parse_format(n.text)
+            fmt.color = col
+            n.text = apply_format(fmt)
         self.canvas.refresh_selected()
         self._push_code_to_editor()
         self._push_history()
@@ -1020,6 +1158,29 @@ class MainWindow(QMainWindow):
         self.editor.setPlainText(code)
         self._syncing = False
 
+    def _copy(self):
+        if self.editor.hasFocus():
+            self.editor.copy()
+        else:
+            self.canvas.copy_selection()
+
+    def _cut(self):
+        if self.editor.hasFocus():
+            self.editor.cut()
+            return
+        self.canvas.copy_selection()
+        self.canvas.delete_selected()
+        self._push_code_to_editor()
+        self._push_history()
+
+    def _paste(self):
+        if self.editor.hasFocus():
+            self.editor.paste()
+        else:
+            self.canvas.paste_at_cursor()
+            self._push_code_to_editor()
+            self._push_history()
+
     def undo(self):
         if self.editor.hasFocus():
             self.editor.undo()
@@ -1047,7 +1208,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Nothing to redo.", 2000)
 
     # ==================================================================
-    # grouping (scopes)
+    # copy / cut / paste (canvas elements or editor text, by focus)
     # ==================================================================
     def group_selection(self):
         sel = self.canvas.selected_elements()
@@ -1115,6 +1276,16 @@ class MainWindow(QMainWindow):
             lambda _: self._fill_palette())
         grp_row.addWidget(self.pal_group, 1)
         lay.addLayout(grp_row)
+        self.pal_search = QLineEdit()
+        self.pal_search.setPlaceholderText("🔍 search elements…")
+        self.pal_search.setClearButtonEnabled(True)
+        self.pal_search.textChanged.connect(lambda _: self._fill_palette())
+        lay.addWidget(self.pal_search)
+        self.pal_search = QLineEdit()
+        self.pal_search.setPlaceholderText("🔍 search elements…")
+        self.pal_search.setClearButtonEnabled(True)
+        self.pal_search.textChanged.connect(lambda _: self._fill_palette())
+        lay.addWidget(self.pal_search)
         self.palette = QListWidget()
         self.palette.setViewMode(QListWidget.ViewMode.IconMode)
         self.palette.setIconSize(QSize(46, 46))
@@ -1133,22 +1304,54 @@ class MainWindow(QMainWindow):
                            "thumbnails)")
         rebuild.setMaximumWidth(30)
         rebuild.clicked.connect(lambda: self._start_library_build(force=True))
-        row.addWidget(add, 1); row.addWidget(rebuild)
+        exp = QPushButton("⇪")
+        exp.setMaximumWidth(30)
+        exp.setToolTip("Export custom elements (respecting the current "
+                       "group filter and search) to a .tikzlib bundle")
+        exp.clicked.connect(self._export_elements)
+        imp = QPushButton("⇩")
+        imp.setMaximumWidth(30)
+        imp.setToolTip("Import custom elements from a .tikzlib bundle")
+        imp.clicked.connect(self._import_elements)
+        row.addWidget(add, 1); row.addWidget(exp); row.addWidget(imp)
+        row.addWidget(rebuild)
         lay.addLayout(row)
+        io_row = QHBoxLayout()
+        exp = QPushButton("⇧ Export…")
+        exp.setToolTip("Export your custom elements (current group, or "
+                       "all) to a shareable .json bundle")
+        exp.clicked.connect(self._export_elements)
+        imp = QPushButton("⇩ Import…")
+        imp.setToolTip("Import a custom-element bundle exported from "
+                       "TikZ Studio")
+        imp.clicked.connect(self._import_elements)
+        io_row.addWidget(exp); io_row.addWidget(imp)
+        lay.addLayout(io_row)
         self.palette.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu)
         self.palette.customContextMenuRequested.connect(self._palette_menu)
         return w
 
+    def _library_needs_rebuild(self):
+        """True when the cache is corrupted or incomplete: catalog
+        entries missing, or built-in thumbnails lost."""
+        builtins = [s for s in REGISTRY.shapes.values() if not s.custom]
+        if not builtins:
+            return True
+        for n, _, _ in libmod.CATALOG:
+            if REGISTRY.get(n) is None:
+                return True
+        for sh in builtins:
+            if not sh.thumb or not os.path.exists(sh.thumb):
+                return True
+        return False
+
     def _init_library(self):
-        loaded = REGISTRY.load() and any(not s.custom
-                                         for s in REGISTRY.shapes.values())
-        missing = [n for n, _, _ in libmod.CATALOG
-                   if REGISTRY.get(n) is None]
-        if loaded and not missing:
-            self._fill_palette()
+        REGISTRY.load()
+        if self._library_needs_rebuild():
+            self._start_library_build()    # corrupted/stale -> rebuild
         else:
-            self._start_library_build()
+            self._fill_palette()
 
     def _start_library_build(self, force=False):
         if getattr(self, "_lib_thread", None) and self._lib_thread.isRunning():
@@ -1185,8 +1388,12 @@ class MainWindow(QMainWindow):
             self.pal_group.setCurrentText(cur)
         self.pal_group.blockSignals(False)
         want = self.pal_group.currentText()
+        query = self.pal_search.text().strip().lower() \
+            if hasattr(self, "pal_search") else ""
         shapes = sorted((sh for sh in REGISTRY.shapes.values()
-                         if want in ("All", sh.group)),
+                         if want in ("All", sh.group)
+                         and (not query or query in sh.name.lower()
+                              or query in sh.group.lower())),
                         key=lambda s: (s.custom, s.group, s.name))
         for sh in shapes:
             label = ("★ " if sh.custom else "") + sh.name
@@ -1201,6 +1408,48 @@ class MainWindow(QMainWindow):
                 f"{len(shapes)} element(s) in "
                 f"'{self.pal_group.currentText()}' — click one, then "
                 "click the canvas to place it.")
+
+    def _export_elements(self):
+        want = self.pal_group.currentText()
+        query = self.pal_search.text().strip().lower()
+        shapes = [sh for sh in REGISTRY.shapes.values() if sh.custom
+                  and want in ("All", sh.group)
+                  and (not query or query in sh.name.lower()
+                       or query in sh.group.lower())]
+        if not shapes:
+            QMessageBox.information(
+                self, "Export elements",
+                "No custom elements match the current group/search "
+                "filter. Built-in elements are not exported — they are "
+                "regenerated from the catalog.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export custom elements", "my_elements.tikzlib",
+            "TikZ Studio elements (*.tikzlib)")
+        if not path:
+            return
+        n = export_bundle(path, shapes)
+        self.statusBar().showMessage(
+            f"Exported {n} custom element(s) to "
+            f"{os.path.basename(path)}.", 6000)
+
+    def _import_elements(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import custom elements", self.base_dir or "",
+            "TikZ Studio elements (*.tikzlib);;All files (*)")
+        if not path:
+            return
+        try:
+            added, skipped = import_bundle(path)
+        except (ValueError, OSError, KeyError) as e:
+            QMessageBox.warning(self, "Import elements",
+                                f"Could not import: {e}")
+            return
+        self._fill_palette()
+        msg = f"Imported {len(added)} element(s)."
+        if skipped:
+            msg += f" Skipped {len(skipped)} identical duplicate(s)."
+        self.statusBar().showMessage(msg, 6000)
 
     def _palette_menu(self, pos):
         item = self.palette.itemAt(pos)
@@ -1254,9 +1503,24 @@ class MainWindow(QMainWindow):
         for pkg in sh.packages:
             if pkg not in self.doc.packages:
                 self.doc.packages.append(pkg)
-        self.fig().elements.append(
-            LibraryEl(name=sh.name, template=sh.template, x=x, y=y))
+        if sh.custom:
+            # custom snippets are inserted as plain TikZ (no % lib: marker)
+            # so they behave as a normal scope: scalable, rotatable,
+            # fully editable in code
+            from .elements import fnum
+            code = (sh.template.replace("@X@", fnum(x))
+                    .replace("@Y@", fnum(y)))
+            new_els = parse_body(code)
+            self.fig().elements.extend(new_els)
+        else:
+            new_els = [LibraryEl(name=sh.name, template=sh.template,
+                                 x=x, y=y)]
+            self.fig().elements.extend(new_els)
         self.canvas.rebuild_scene()
+        from .canvas import ElementItem
+        for it in self.canvas.scene().items():
+            if isinstance(it, ElementItem) and it.element in new_els:
+                it.setSelected(True)
         self.canvas.set_tool("select")
         self._push_code_to_editor()
         self._push_history()
@@ -1575,4 +1839,7 @@ def main():
     app.setApplicationName("TikZ Studio")
     win = MainWindow()
     win.show()
+    # "Open with TikZ Studio": load the file passed by the file manager
+    if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
+        win._load_tex_file(os.path.abspath(sys.argv[1]))
     sys.exit(app.exec())

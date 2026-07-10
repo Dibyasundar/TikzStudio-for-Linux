@@ -799,9 +799,78 @@ class GroupItem(ElementItem):
                              + QPointF(2, -3), "scope")
 
 
+class LibraryItem(ElementItem):
+    """Palette element drawn from its actual TikZ code (vector redraw);
+    the cached thumbnail is only a fallback for unparseable snippets."""
+
+    def rebuild(self):
+        from .parser import parse_body
+        e: LibraryEl = self.element
+        for ch in list(self.childItems()):
+            if isinstance(ch, ElementItem):
+                ch.setParentItem(None)
+                if ch.scene():
+                    ch.scene().removeItem(ch)
+        self.setPath(QPainterPath())
+        self.setPen(QPen(Qt.PenStyle.NoPen))
+        self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        body = e.template.replace("@X@", "0").replace("@Y@", "0")
+        subs = [x for x in parse_body(body)
+                if not isinstance(x, (RawEl, PgfEl))]
+        self._thumb_fallback = not subs
+        for child in subs:
+            it = make_item(child, self.canvas, self.pgf)
+            it.setParentItem(self)
+            it.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+            it.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable,
+                       False)
+            it.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        t = QTransform()
+        c = to_scene(e.x, e.y)
+        t.translate(c.x(), c.y())
+        t.rotate(-e.rotate)
+        t.scale(e.scale, e.scale)
+        if self.pgf is not None and not self.pgf.qt.isIdentity():
+            t = t * self.pgf.qt
+        self.setTransform(t)
+        self.setOpacity(e.style.opacity)
+
+    def boundingRect(self) -> QRectF:
+        if getattr(self, "_thumb_fallback", True):
+            w, h = self.canvas.lib_size_px(self.element.name)
+            return QRectF(-w / 2, -h / 2, w, h)
+        return self.childrenBoundingRect().adjusted(-4, -4, 4, 4)
+
+    def shape(self):
+        p = QPainterPath()
+        p.addRect(self.boundingRect())
+        return p
+
+    def paint(self, painter, option, widget=None):
+        if getattr(self, "_thumb_fallback", True):
+            pm = self.canvas.lib_pixmap(self.element.name)
+            r = self.boundingRect()
+            if pm:
+                painter.drawPixmap(r.toRect(), pm)
+            else:
+                painter.setPen(QPen(QColor("gray"), 1,
+                                    Qt.PenStyle.DashLine))
+                painter.drawRect(r)
+                painter.drawText(r, Qt.AlignmentFlag.AlignCenter,
+                                 self.element.name)
+        if self.isSelected():
+            painter.setPen(QPen(QColor(30, 120, 255), 1,
+                                Qt.PenStyle.DashLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(self.boundingRect())
+
+
 def make_item(e: Element, canvas: "Canvas", pgf=None) -> ElementItem:
-    return GroupItem(e, canvas, pgf) if isinstance(e, GroupEl) \
-        else ElementItem(e, canvas, pgf)
+    if isinstance(e, GroupEl):
+        return GroupItem(e, canvas, pgf)
+    if isinstance(e, LibraryEl):
+        return LibraryItem(e, canvas, pgf)
+    return ElementItem(e, canvas, pgf)
 
 
 # ----------------------------------------------------------------------
@@ -821,7 +890,8 @@ class Canvas(QGraphicsView):
         self.setScene(self._scene)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
-        # multi-select picks WHOLE elements only (fully inside the band)
+        # multi-select picks WHOLE elements only (fully inside the band);
+        # configurable via set_selection_mode()
         self.setRubberBandSelectionMode(
             Qt.ItemSelectionMode.ContainsItemShape)
         self.setTransformationAnchor(
@@ -830,7 +900,10 @@ class Canvas(QGraphicsView):
         self.tool = "select"
         self.snap = True
         self.show_grid = True
+        self.auto_select = True        # revert to Select after drawing
         self.grid_step = 0.5   # cm — visible grid AND snap step
+        self.auto_revert = True     # back to Select after drawing (setting)
+        self._last_mouse = (0.0, 0.0)   # cm, for paste-at-cursor
         self.base_dir = ""     # folder of the opened .tex (relative images)
         self.default_style = Style()
         self.star_points = 5
@@ -841,6 +914,11 @@ class Canvas(QGraphicsView):
         self._pix_cache = {}
         self._handle_owner: Optional[ElementItem] = None
         self._scene.selectionChanged.connect(self._sel_changed)
+
+    def set_selection_mode(self, partial: bool):
+        self.setRubberBandSelectionMode(
+            Qt.ItemSelectionMode.IntersectsItemShape if partial
+            else Qt.ItemSelectionMode.ContainsItemShape)
 
     # -- image / library helpers -------------------------------------------
     def resolve_path(self, path: str) -> str:
@@ -877,6 +955,74 @@ class Canvas(QGraphicsView):
         return sh.size_cm[0] * SCALE, sh.size_cm[1] * SCALE
 
     # -- tools / figure -------------------------------------------------------
+    def set_partial_select(self, partial: bool):
+        self.setRubberBandSelectionMode(
+            Qt.ItemSelectionMode.IntersectsItemShape if partial
+            else Qt.ItemSelectionMode.ContainsItemShape)
+
+    # -- copy / paste ---------------------------------------------------------
+    def copy_selection(self):
+        sel = self.selected_elements()
+        if not sel:
+            return
+        code = "\n".join(e.to_tikz() for e in self.figure.elements
+                         if e in sel)
+        self._clipboard_code = code           # internal fallback
+        from PyQt6.QtWidgets import QApplication
+        QApplication.clipboard().setText(code)
+        self.status.emit(f"Copied {len(sel)} element(s).")
+
+    @staticmethod
+    def _anchor_of(el):
+        h = el.handles()
+        if h:
+            return (sum(p[0] for p in h) / len(h),
+                    sum(p[1] for p in h) / len(h))
+        if hasattr(el, "x") and hasattr(el, "y"):
+            return el.x, el.y
+        return None
+
+    def paste_at_cursor(self):
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtGui import QCursor
+        text = QApplication.clipboard().text()
+        if not text.strip():
+            text = getattr(self, "_clipboard_code", "")
+        if not text.strip():
+            return
+        from .parser import parse_body
+        try:
+            els = parse_body(text)
+        except Exception:
+            return
+        els = [e for e in els if not isinstance(e, PgfEl)]
+        if not els:
+            return
+        anchors = [a for a in (self._anchor_of(e) for e in els)
+                   if a is not None]
+        vp = self.viewport().mapFromGlobal(QCursor.pos())
+        if self.viewport().rect().contains(vp):
+            sp = self._snap_pt(self.mapToScene(vp))
+            cx, cy = from_scene(sp)
+        else:
+            cx, cy = self._last_mouse
+            if self.snap:
+                g = max(self.grid_step, 0.01)
+                cx, cy = round(cx / g) * g, round(cy / g) * g
+        if anchors:
+            ax = sum(a[0] for a in anchors) / len(anchors)
+            ay = sum(a[1] for a in anchors) / len(anchors)
+            dx, dy = round(cx - ax, 3), round(cy - ay, 3)
+            for e in els:
+                e.translate(dx, dy)
+        self.figure.elements += els
+        self.rebuild_scene()
+        for it in self._scene.items():
+            if isinstance(it, ElementItem) and it.element in els:
+                it.setSelected(True)
+        self.model_changed.emit()
+        self.status.emit(f"Pasted {len(els)} element(s) at the cursor.")
+
     def set_tool(self, tool: str):
         self.tool = tool
         self._poly_pts = []
@@ -1051,6 +1197,7 @@ class Canvas(QGraphicsView):
         return path
 
     def mouseMoveEvent(self, ev):
+        self._last_mouse = from_scene(self.mapToScene(ev.pos()))
         if self.tool == "select" or self._start is None:
             if self.tool in ("polygon", "multiarrow", "bezier") \
                     and self._poly_pts:
@@ -1142,6 +1289,18 @@ class Canvas(QGraphicsView):
     # -- arrow keys: precise nudging -----------------------------------------
     def keyPressEvent(self, ev):
         key = ev.key()
+        ctrl = ev.modifiers() & Qt.KeyboardModifier.ControlModifier
+        shift = ev.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        if ctrl and shift and key == Qt.Key.Key_C:
+            self.copy_selection()
+            return
+        if ctrl and shift and key == Qt.Key.Key_V:
+            self.paste_at_cursor()
+            return
+        if ctrl and shift and key == Qt.Key.Key_X:
+            self.copy_selection()
+            self.delete_selected()
+            return
         if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             self.delete_selected()
             return
@@ -1239,8 +1398,9 @@ class Canvas(QGraphicsView):
         self.figure.elements.append(el)
         self.rebuild_scene()
         self.model_changed.emit()
-        # back to select mode once the drawing is complete
-        self.set_tool("select")
+        # back to select mode once the drawing is complete (configurable)
+        if self.auto_select:
+            self.set_tool("select")
         # keep the fresh element selected for immediate tweaking
         for it in self._scene.items():
             if isinstance(it, ElementItem) and it.element is el:
