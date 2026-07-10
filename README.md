@@ -10,7 +10,7 @@ two-way synchronization** between a visual canvas and the TikZ source code.
 ## Install (Debian/Ubuntu)
 
 ```bash
-sudo apt install ./tikzstudio_1.6.0_all.deb
+sudo apt install ./tikzstudio_1.7.1_all.deb
 ```
 
 This pulls in the dependencies automatically: `python3-pyqt6`,
@@ -121,6 +121,31 @@ Launch from the application menu (**TikZ Studio**) or run `tikzstudio`.
   to the preamble automatically.
 
 **Workspace**
+- **"Open with TikZ Studio"**: the package registers `.tex`/`.tikz`/
+  `.pgf` MIME associations, so the app appears in your file manager's
+  right-click *Open With* menu; files passed on the command line
+  (`tikzstudio fig.tex`) open directly.
+- **Copy/paste on canvas**: Ctrl+Shift+C copies the selection as real
+  TikZ code (usable in any editor), Ctrl+Shift+X cuts, and
+  Ctrl+Shift+V pastes centred at the mouse cursor, snapped to the
+  grid, with the pasted copies selected. Plain Ctrl+C/V keep their
+  native text behaviour in the code editor.
+- **Settings** (menu): toggle auto-revert to the Select tool after
+  drawing, and switch the rubber band between whole-element and
+  partial (touch) selection. All settings live in `~/.config` and
+  custom elements/groups in `~/.local/share/tikzstudio` — both survive
+  app updates (old caches migrate automatically).
+- **Element palette**: live search box; ⇪/⇩ buttons export/import
+  custom elements (with groups and thumbnails) as portable `.tikzlib`
+  bundles for sharing between machines. Custom elements are inserted
+  as plain TikZ scopes (no `% lib:` marker) so they scale, rotate and
+  edit like any group; the library rebuilds itself automatically if
+  its cache is corrupted or thumbnails go missing.
+- **Library elements are true vectors**: the palette thumbnail is only
+  a preview — placed elements are redrawn on the canvas from their
+  actual TikZ code, and every element (built-in, custom, or path) has
+  Rotate / Scale properties; transformed library elements emit a
+  wrapping scope and round-trip through the code.
 - **Accordion side panels**: left panel stacks Properties / Elements /
   Files, right panel stacks TikZ code / PDF preview — with slim margin
   arrows on both window edges to hide or show each side entirely.
@@ -227,6 +252,9 @@ tikzstudio/
   dialogs.py    package/library manager
   app.py        main window
 ```
+
+
+
 ## Screenshot of UI
 <img width="1845" height="1020" alt="UI" src="https://github.com/user-attachments/assets/d74efc4b-3cd7-4a84-963a-1dbb186145c8" />
 
