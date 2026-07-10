@@ -1,5 +1,3 @@
-**This project aims to develop a native Linux interface inspired by TikZedit. Please note that the majority of the codebase was generated using Claude's Fabel AI model. The software is currently under active development and is provided "as is," so please use it at your own discretion. We anticipate rolling out new version releases in the near future.**
-
 # TikZ Studio
 
 A WYSIWYG desktop editor for TikZ/LaTeX diagrams on Linux, with **live
@@ -8,7 +6,7 @@ two-way synchronization** between a visual canvas and the TikZ source code.
 ## Install (Debian/Ubuntu)
 
 ```bash
-sudo apt install ./tikzstudio_1.2.0_all.deb
+sudo apt install ./tikzstudio_1.3.0_all.deb
 ```
 
 This pulls in the dependencies automatically: `python3-pyqt6`,
@@ -40,6 +38,22 @@ Launch from the application menu (**TikZ Studio**) or run `tikzstudio`.
   appears in the palette permanently (marked ★).
 
 **Visual canvas (left/center)**
+- **Faithful option rendering**: node options (`anchor=`, `scale=`,
+  `rotate=`, `minimum width/height/size=`, `text width=` with wrapping,
+  `align=`, positional `above`/`below left`/…) all affect the canvas;
+  `\includegraphics` honours every graphicx combination (width+height,
+  `keepaspectratio`, `scale=`, `angle=`, other keys preserved); xcolor
+  mix chains like `green!40!blue!20` render exactly; `draw opacity`,
+  `fill opacity` and `rounded corners` are shown. **Any other TikZ
+  option typed in code is preserved verbatim** — elements no longer
+  drop out of visual editing because of an option the canvas doesn't
+  draw.
+- **Math on canvas**: `$...$` node text renders as Unicode math (Greek
+  letters, sub/superscripts, operators, fractions) so labels look right
+  without waiting for a compile.
+- **Multipoint arrows**: the Arrow toolbar button is a dropdown —
+  straight (drag) or multipoint (click waypoints, double-click to
+  finish), emitted as an open polyline with arrow tips.
 - **Distinct arrowheads**: `->`/`<-`/`<->` render as classic open tips,
   `-Stealth` as a filled dart, `-Latex` as a filled triangle — on lines,
   Bézier curves, arcs and freehand plots, at both ends.
@@ -69,6 +83,17 @@ Launch from the application menu (**TikZ Studio**) or run `tikzstudio`.
   to the preamble automatically.
 
 **Code editor (right dock)**
+- **Two editing modes**: *Current figure body* (default, syncs with the
+  canvas) or *Whole document* — full .tex file editing including the
+  preamble, packages and every figure, still live-synced back into the
+  app. Opens `.tex`, `.tikz`, `.pgf` and bare TikZ body files.
+- **Comment / uncomment** the selected lines with Ctrl+T / Ctrl+R;
+  **find** with Ctrl+F (F3 next, Shift+F3 previous); **undo/redo** with
+  Ctrl+Z / Ctrl+Shift+Z (works in the editor *and* on canvas edits —
+  each figure keeps a 200-step history).
+- **Auto-suggest while typing**: commands complete after `\`, and plain
+  option/tag words (anchors, `rounded corners`, decorations, graphicx
+  keys, …) pop up after two letters. Ctrl+Space forces the popup.
 - TikZ syntax highlighting and autocompletion (`Ctrl+Space`, or automatic
   after typing `\`).
 - **Number scrubbing**: hold `Ctrl` and scroll the mouse wheel over any
@@ -131,3 +156,16 @@ sudo apt install python3-pyqt6 texlive-latex-extra texlive-pictures poppler-util
 python3 run.py
 ```
 
+## Layout
+
+```
+tikzstudio/
+  elements.py   data model + TikZ code generation
+  parser.py     TikZ -> model (two-way sync, lossless via RawEl)
+  canvas.py     QGraphicsView drawing canvas & tools
+  editor.py     code editor: highlighting, completion, number scrubbing
+  compiler.py   background pdflatex + pdftoppm preview
+  library.py    pre-compiled element library, cache & custom elements
+  dialogs.py    package/library manager
+  app.py        main window
+```

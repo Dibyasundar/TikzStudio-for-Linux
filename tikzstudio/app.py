@@ -14,7 +14,8 @@ from PyQt6.QtWidgets import (QMainWindow, QToolBar, QDockWidget, QLabel,
                              QScrollArea, QSpinBox, QColorDialog,
                              QPlainTextEdit, QInputDialog, QApplication,
                              QListWidget, QListWidgetItem, QDialog,
-                             QDialogButtonBox, QLineEdit, QFormLayout)
+                             QDialogButtonBox, QLineEdit, QFormLayout,
+                             QToolButton, QMenu)
 
 from .elements import (TikzDocument, Figure, Style, NodeEl, ImageEl, GridEl,
                        ArcEl, RawEl, LibraryEl, GroupEl, TREE_TEMPLATE,
@@ -115,6 +116,35 @@ class MainWindow(QMainWindow):
                      "bezier": "B", "freehand": "F", "node": "N"}
         for tool in TOOLS:
             icon, tip = TOOL_LABELS[tool]
+            if tool == "arrow":
+                # dropdown: straight arrow / multipoint arrow
+                btn = QToolButton()
+                btn.setText("→ Arrow")
+                btn.setToolTip("Arrows: straight (drag) or multipoint "
+                               "(click waypoints, double-click to finish)")
+                btn.setPopupMode(
+                    QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+                menu = QMenu(btn)
+                a1 = menu.addAction("→ Straight arrow  (A)")
+                a2 = menu.addAction("↝ Multipoint arrow")
+                a1.triggered.connect(
+                    lambda: (btn.setText("→ Arrow"),
+                             self.canvas.set_tool("arrow")))
+                a2.triggered.connect(
+                    lambda: (btn.setText("↝ Multi-arrow"),
+                             self.canvas.set_tool("multiarrow")))
+                btn.setMenu(menu)
+                btn.clicked.connect(
+                    lambda: self.canvas.set_tool(
+                        "multiarrow" if btn.text().startswith("↝")
+                        else "arrow"))
+                arr_short = QAction(self)
+                arr_short.setShortcut("A")
+                arr_short.triggered.connect(
+                    lambda: self.canvas.set_tool("arrow"))
+                self.addAction(arr_short)
+                tb.addWidget(btn)
+                continue
             act = QAction(f"{icon} {tool.capitalize()}", self)
             act.setCheckable(True)
             act.setToolTip(tip)
@@ -165,8 +195,21 @@ class MainWindow(QMainWindow):
         self.editor.textChanged.connect(self._editor_changed)
         w = QWidget(); lay = QVBoxLayout(w)
         lay.setContentsMargins(4, 4, 4, 4)
-        hint = QLabel("tikzpicture body of the current figure — two-way sync. "
-                      "Ctrl+Wheel over a number scrubs it; Ctrl+Space completes.")
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Edit:"))
+        self.code_mode = "figure"
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Current figure body", "Whole document"])
+        self.mode_combo.setToolTip(
+            "Figure body: two-way sync with the canvas.\n"
+            "Whole document: full .tex file editing — preamble, packages "
+            "and every figure, still live-synced.")
+        self.mode_combo.currentIndexChanged.connect(self._code_mode_changed)
+        top.addWidget(self.mode_combo, 1)
+        lay.addLayout(top)
+        hint = QLabel("Two-way sync. Ctrl+Wheel scrubs numbers · Ctrl+Space "
+                      "completes · Ctrl+T/Ctrl+R (un)comment lines · "
+                      "Ctrl+F find (F3 next) · Ctrl+Z undo.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#6b7280; font-size:11px;")
         lay.addWidget(hint); lay.addWidget(self.editor, 1)
@@ -235,6 +278,12 @@ class MainWindow(QMainWindow):
         self.p_imgw.setValue(3.0); self.p_imgw.setSuffix(" cm")
         self.p_imgw.valueChanged.connect(lambda v: self._set_attr("width", v))
         self.props_form.addRow("Image width", self.p_imgw)
+        self.p_imgh = QDoubleSpinBox(); self.p_imgh.setRange(0.0, 30)
+        self.p_imgh.setValue(0.0); self.p_imgh.setSuffix(" cm")
+        self.p_imgh.setSpecialValueText("auto")
+        self.p_imgh.setToolTip("graphicx height= (0 = auto from width)")
+        self.p_imgh.valueChanged.connect(lambda v: self._set_attr("height", v))
+        self.props_form.addRow("Image height", self.p_imgh)
         self.p_scale = QDoubleSpinBox(); self.p_scale.setRange(0.05, 20)
         self.p_scale.setSingleStep(0.1); self.p_scale.setValue(1.0)
         self.p_scale.setToolTip("Scale of the selected scope group")
@@ -294,6 +343,14 @@ class MainWindow(QMainWindow):
         f.addAction(self._act("Quit", "Ctrl+Q", self.close))
 
         e = m.addMenu("&Edit")
+        e.addAction(self._act("Undo", "Ctrl+Z", self.undo))
+        e.addAction(self._act("Redo", "Ctrl+Shift+Z", self.redo))
+        e.addSeparator()
+        e.addAction(self._act("Comment lines (editor)", "Ctrl+T",
+                              lambda: self.editor._comment_selection(True)))
+        e.addAction(self._act("Uncomment lines (editor)", "Ctrl+R",
+                              lambda: self.editor._comment_selection(False)))
+        e.addSeparator()
         e.addAction(self._act("Delete selection", "Del",
                               self.canvas.delete_selected))
         e.addAction(self._act("Select all", "Ctrl+A",
@@ -373,19 +430,49 @@ class MainWindow(QMainWindow):
             self.current_fig = idx
             self.canvas.load_figure(self.fig())
             self._push_code_to_editor()
+            self._push_history()
 
     # ==================================================================
     # two-way sync
     # ==================================================================
     def _canvas_changed(self):
         self._push_code_to_editor()
+        self._push_history()
         if self.auto_cb.isChecked():
             self._auto_timer.start()
 
     def _push_code_to_editor(self):
         self._syncing = True
-        self.editor.setPlainText(self.fig().body_code())
+        if getattr(self, "code_mode", "figure") == "document":
+            self.editor.setPlainText(self.doc.full_document())
+        else:
+            self.editor.setPlainText(self.fig().body_code())
         self._syncing = False
+
+    def _code_mode_changed(self, idx):
+        self._flush_pending_code()
+        self.code_mode = "document" if idx == 1 else "figure"
+        self._push_code_to_editor()
+
+    def _apply_full_document(self):
+        """Whole-document mode: re-import the full .tex from the editor."""
+        try:
+            doc = import_tex(self.editor.toPlainText())
+        except Exception:
+            return
+        self.doc = doc
+        self.current_fig = min(self.current_fig, len(doc.figures) - 1)
+        self.fig_tabs.blockSignals(True)
+        while self.fig_tabs.count():
+            self.fig_tabs.removeTab(0)
+        for f in self.doc.figures:
+            self.fig_tabs.addTab(f.name)
+        self.fig_tabs.setCurrentIndex(self.current_fig)
+        self.fig_tabs.blockSignals(False)
+        self.canvas.load_figure(self.fig())
+        self._push_history()
+        self.statusBar().showMessage(
+            f"Document re-imported: {len(doc.figures)} figure(s).", 4000)
 
     def _editor_changed(self):
         if self._syncing:
@@ -395,8 +482,12 @@ class MainWindow(QMainWindow):
             self._auto_timer.start()
 
     def _apply_code_to_canvas(self):
+        if getattr(self, "code_mode", "figure") == "document":
+            self._apply_full_document()
+            return
         self.fig().elements = parse_body(self.editor.toPlainText())
         self.canvas.rebuild_scene()
+        self._push_history()
         raw = sum(isinstance(e, RawEl) for e in self.fig().elements)
         msg = f"Parsed {len(self.fig().elements)} statement(s)"
         if raw:
@@ -466,6 +557,7 @@ class MainWindow(QMainWindow):
         is_grp = isinstance(element, GroupEl)
         self.p_a1.setEnabled(is_arc); self.p_a2.setEnabled(is_arc)
         self.p_step.setEnabled(is_grid); self.p_imgw.setEnabled(is_img)
+        self.p_imgh.setEnabled(is_img)
         self.p_scale.setEnabled(is_grp)
         if is_grp:
             self.p_scale.setValue(element.s)
@@ -475,6 +567,7 @@ class MainWindow(QMainWindow):
             self.p_step.setValue(element.step)
         if is_img:
             self.p_imgw.setValue(element.width)
+            self.p_imgh.setValue(element.height)
         if element is None:
             self.sel_label.setText("New shapes use these style settings.\n"
                                    "Select one element to edit it.")
@@ -489,6 +582,56 @@ class MainWindow(QMainWindow):
                 "Drag the square handles to reshape. Arrow keys nudge "
                 "(plain 0.05 cm, Shift = one grid cell, Ctrl = 0.01 cm).")
         self._syncing = False
+
+    # ==================================================================
+    # undo / redo (canvas-level history; editor has its own stack)
+    # ==================================================================
+    def _push_history(self):
+        fig = self.fig()
+        if not hasattr(fig, "_hist"):
+            fig._hist, fig._hpos = [], -1
+        code = fig.body_code()
+        if fig._hpos >= 0 and fig._hist[fig._hpos] == code:
+            return
+        fig._hist = fig._hist[:fig._hpos + 1]
+        fig._hist.append(code)
+        if len(fig._hist) > 200:
+            fig._hist.pop(0)
+        fig._hpos = len(fig._hist) - 1
+
+    def _restore_history(self, code: str):
+        fig = self.fig()
+        fig.elements = parse_body(code)
+        self.canvas.rebuild_scene()
+        self._syncing = True
+        self.editor.setPlainText(code)
+        self._syncing = False
+
+    def undo(self):
+        if self.editor.hasFocus():
+            self.editor.undo()
+            return
+        fig = self.fig()
+        if hasattr(fig, "_hist") and fig._hpos > 0:
+            fig._hpos -= 1
+            self._restore_history(fig._hist[fig._hpos])
+            self.statusBar().showMessage(
+                f"Undo ({fig._hpos + 1}/{len(fig._hist)})", 3000)
+        else:
+            self.statusBar().showMessage("Nothing to undo.", 2000)
+
+    def redo(self):
+        if self.editor.hasFocus():
+            self.editor.redo()
+            return
+        fig = self.fig()
+        if hasattr(fig, "_hist") and fig._hpos < len(fig._hist) - 1:
+            fig._hpos += 1
+            self._restore_history(fig._hist[fig._hpos])
+            self.statusBar().showMessage(
+                f"Redo ({fig._hpos + 1}/{len(fig._hist)})", 3000)
+        else:
+            self.statusBar().showMessage("Nothing to redo.", 2000)
 
     # ==================================================================
     # grouping (scopes)
@@ -867,8 +1010,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Saved {self.file_path}", 5000)
 
     def open_tex(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open .tex", "",
-                                              "LaTeX (*.tex)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open TikZ / LaTeX file", self.base_dir or "",
+            "TikZ / LaTeX (*.tex *.tikz *.pgf *.txt);;All files (*)")
         if not path:
             return
         with open(path, encoding="utf-8") as f:

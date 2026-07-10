@@ -7,11 +7,12 @@ from typing import List, Optional, Tuple
 
 from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal
 from PyQt6.QtGui import (QPainter, QPen, QBrush, QColor, QPainterPath,
-                         QPixmap, QFont, QTransform)
+                         QPixmap, QFont, QTransform, QFontMetricsF)
 from PyQt6.QtWidgets import (QGraphicsView, QGraphicsScene, QGraphicsItem,
                              QGraphicsPathItem, QGraphicsRectItem,
                              QInputDialog, QFileDialog)
 
+from .mathtext import latex_to_unicode
 from .elements import (SCALE, Style, Element, LineEl, RectEl, CircleEl,
                        EllipseEl, PolyEl, BezierEl, PlotEl, ArcEl, GridEl,
                        NodeEl, ImageEl, RawEl, LibraryEl, GroupEl, Figure)
@@ -23,30 +24,47 @@ TOOLS = ["select", "line", "arrow", "rect", "circle", "ellipse", "polygon",
 # ----------------------------------------------------------------------
 # colours
 # ----------------------------------------------------------------------
-def qcolor(tikz: str) -> QColor:
-    """Best-effort conversion of a TikZ colour expression to QColor."""
-    if not tikz:
-        return QColor(0, 0, 0, 0)
-    m = _re.match(r"\{?rgb,255:red,(\d+);green,(\d+);blue,(\d+)\}?",
-                  tikz.strip())
+NAMED = {  # xcolor base colours (Qt's SVG names differ, e.g. green)
+    "red": "#ff0000", "green": "#00ff00", "blue": "#0000ff",
+    "cyan": "#00ffff", "magenta": "#ff00ff", "yellow": "#ffff00",
+    "black": "#000000", "white": "#ffffff",
+    "gray": "#808080", "grey": "#808080", "darkgray": "#404040",
+    "lightgray": "#bfbfbf", "olive": "#808000", "teal": "#008080",
+    "violet": "#800080", "purple": "#bf0040", "lime": "#bfff00",
+    "orange": "#ff8000", "pink": "#ffbfbf", "brown": "#bf8040"}
+
+
+def _base_color(tok: str) -> QColor:
+    tok = tok.strip()
+    m = _re.match(r"\{?rgb,255:red,(\d+);green,(\d+);blue,(\d+)\}?", tok)
     if m:
         return QColor(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-    base = tikz.split("!")[0].strip()
-    named = {"gray": "#808080", "grey": "#808080", "darkgray": "#404040",
-             "lightgray": "#c0c0c0", "olive": "#808000", "teal": "#008080",
-             "violet": "#8000ff", "purple": "#c00080", "lime": "#bfff00",
-             "orange": "#ff8000", "pink": "#ffc0cb", "brown": "#a0522d"}
-    c = QColor(named.get(base, base))
-    if not c.isValid():
-        c = QColor("black")
-    if "!" in tikz:  # e.g. blue!20 -> mix with white
+    c = QColor(NAMED.get(tok, tok))
+    return c if c.isValid() else QColor("black")
+
+
+def qcolor(tikz: str) -> QColor:
+    """TikZ/xcolor expression -> QColor, incl. mix chains a!p!b!q!c."""
+    if not tikz:
+        return QColor(0, 0, 0, 0)
+    tikz = tikz.strip()
+    m = _re.match(r"\{?rgb,255:red,(\d+);green,(\d+);blue,(\d+)\}?", tikz)
+    if m:
+        return QColor(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    parts = tikz.split("!")
+    c = _base_color(parts[0])
+    i = 1
+    while i < len(parts):
         try:
-            pct = float(tikz.split("!")[1].split("!")[0]) / 100.0
-            c = QColor(int(c.red() * pct + 255 * (1 - pct)),
-                       int(c.green() * pct + 255 * (1 - pct)),
-                       int(c.blue() * pct + 255 * (1 - pct)))
+            pct = max(0.0, min(100.0, float(parts[i]))) / 100.0
         except ValueError:
-            pass
+            break
+        other = (_base_color(parts[i + 1]) if i + 1 < len(parts)
+                 else QColor("white"))
+        c = QColor(round(c.red() * pct + other.red() * (1 - pct)),
+                   round(c.green() * pct + other.green() * (1 - pct)),
+                   round(c.blue() * pct + other.blue() * (1 - pct)))
+        i += 2
     return c
 
 
@@ -144,11 +162,28 @@ def arrow_heads(e: Element) -> List[Tuple[QPainterPath, bool]]:
             tip = (e.cx + e.r * math.cos(rad), e.cy + e.r * math.sin(rad))
             tangent = (-math.sin(rad) * s, math.cos(rad) * s)
             add(kind, tip, tangent)
-    elif isinstance(e, PlotEl) and len(e.points) >= 2:
+    elif isinstance(e, (PlotEl, PolyEl)) and len(getattr(e, "points", [])) >= 2:
+        if isinstance(e, PolyEl) and e.closed:
+            return heads
         p = e.points
         add(end_k, p[-1], (p[-1][0] - p[-2][0], p[-1][1] - p[-2][1]))
         add(start_k, p[0], (p[0][0] - p[1][0], p[0][1] - p[1][1]))
     return heads
+
+
+def rounded_radius(st: Style) -> float:
+    """px radius if the style carries a 'rounded corners' option."""
+    for it in st.extra:
+        m = _re.fullmatch(r"rounded corners(?:\s*=\s*([\d.]+)\s*"
+                          r"(pt|mm|cm)?)?", it.strip())
+        if m:
+            if m.group(1):
+                v = float(m.group(1))
+                cm = v * {"pt": 0.035146, "mm": 0.1,
+                          "cm": 1.0}[m.group(2) or "pt"]
+                return cm * SCALE
+            return 4 * 0.035146 * SCALE      # TikZ default 4pt
+    return 0.0
 
 
 # ----------------------------------------------------------------------
@@ -159,8 +194,12 @@ def element_path(e: Element, canvas: "Canvas") -> QPainterPath:
     if isinstance(e, LineEl):
         path.moveTo(to_scene(e.x1, e.y1)); path.lineTo(to_scene(e.x2, e.y2))
     elif isinstance(e, RectEl):
-        path.addRect(QRectF(to_scene(e.x1, e.y1),
-                            to_scene(e.x2, e.y2)).normalized())
+        r = QRectF(to_scene(e.x1, e.y1), to_scene(e.x2, e.y2)).normalized()
+        rad = rounded_radius(e.style)
+        if rad > 0:
+            path.addRoundedRect(r, rad, rad)
+        else:
+            path.addRect(r)
     elif isinstance(e, CircleEl):
         path.addEllipse(to_scene(e.cx, e.cy), e.r * SCALE, e.r * SCALE)
     elif isinstance(e, EllipseEl):
@@ -194,6 +233,63 @@ def element_path(e: Element, canvas: "Canvas") -> QPainterPath:
         while y <= y2 + 1e-9:
             path.moveTo(to_scene(x1, y)); path.lineTo(to_scene(x2, y)); y += s
     return path
+
+
+ALIGN_FLAGS = {"left": Qt.AlignmentFlag.AlignLeft,
+               "right": Qt.AlignmentFlag.AlignRight,
+               "center": Qt.AlignmentFlag.AlignHCenter}
+
+
+def node_box(e: NodeEl):
+    """Layout of a node: (display text, font, local QRectF, text flags).
+
+    The rect is in scene px, in a local frame whose origin is the node's
+    "at" coordinate (rotation applied separately by the painter).
+    """
+    disp = latex_to_unicode(e.text).replace("\\\\", "\n")
+    pt_size = max(1, round(9 * (e.scale if e.scale > 0 else 1)))
+    font = QFont("DejaVu Sans", pt_size)
+    font.setItalic("$" in e.text)
+    fm = QFontMetricsF(font)
+    halign = ALIGN_FLAGS.get(e.align, Qt.AlignmentFlag.AlignHCenter)
+    flags = int(halign | Qt.AlignmentFlag.AlignVCenter)
+    if e.text_width > 0:
+        flags |= int(Qt.TextFlag.TextWordWrap)
+        avail = QRectF(0, 0, e.text_width * SCALE * max(e.scale, 0.05), 5000)
+    else:
+        avail = QRectF(0, 0, 5000, 5000)
+    tr = fm.boundingRect(avail, flags, disp)
+    sc = max(e.scale, 0.05)
+    w = tr.width() + 9
+    h = tr.height() + 7
+    if e.text_width > 0:
+        w = e.text_width * SCALE * sc + 9
+    w = max(w, e.min_w * SCALE * sc, 16)
+    h = max(h, e.min_h * SCALE * sc, 14)
+    if e.shape == "circle":
+        w = h = max(w, h)
+    # anchor: which point of the box sits on the coordinate
+    dx = dy = 0.0
+    a = e.anchor
+    if "west" in a:
+        dx = +w / 2
+    if "east" in a:
+        dx = -w / 2
+    if "north" in a:
+        dy = +h / 2       # scene y grows downward
+    if "south" in a:
+        dy = -h / 2
+    rect = QRectF(dx - w / 2, dy - h / 2, w, h)
+    return disp, font, rect, flags
+
+
+def node_transform(e: NodeEl) -> QTransform:
+    t = QTransform()
+    c = to_scene(e.x, e.y)
+    t.translate(c.x(), c.y())
+    if abs(e.rotate) > 1e-9:
+        t.rotate(-e.rotate)          # TikZ rotates CCW; scene y is flipped
+    return t
 
 
 # ----------------------------------------------------------------------
@@ -235,6 +331,38 @@ class HandleItem(QGraphicsRectItem):
         ev.accept()
 
 
+def image_display_size(e: ImageEl, canvas: "Canvas"):
+    """(w_px, h_px) honouring width/height/keepaspectratio/scale."""
+    pm = canvas.image_pixmap(e.path)
+    aspect = canvas.image_aspect(e.path)          # h / w
+    if e.gscale > 0 and pm:
+        w = pm.width() / 72.0 * 2.54 * e.gscale   # natural size at 72 dpi
+        h = w * aspect
+    elif e.width > 0 and e.height > 0:
+        if e.keepaspect:
+            w = e.width; h = w * aspect
+            if h > e.height + 1e-9:
+                h = e.height; w = h / aspect if aspect else w
+        else:
+            w, h = e.width, e.height
+    elif e.width > 0:
+        w = e.width; h = w * aspect
+    elif e.height > 0:
+        h = e.height; w = h / aspect if aspect else h
+    else:
+        w = 3.0; h = 3.0 * aspect
+    return w * SCALE, h * SCALE
+
+
+def image_transform(e: ImageEl) -> QTransform:
+    t = QTransform()
+    c = to_scene(e.x, e.y)
+    t.translate(c.x(), c.y())
+    if abs(e.angle) > 1e-9:
+        t.rotate(-e.angle)
+    return t
+
+
 # ----------------------------------------------------------------------
 # Graphics item wrapping one Element
 # ----------------------------------------------------------------------
@@ -255,7 +383,7 @@ class ElementItem(QGraphicsPathItem):
     def rebuild(self):
         e = self.element
         st = e.style
-        pen = QPen(qcolor(st.draw or "black"))
+        pen = QPen(qcolor_alpha(st.draw or "black", st.draw_opacity))
         pen.setWidthF(max(st.line_width * 1.6, 1.0))
         if st.dash == "dashed":
             pen.setStyle(Qt.PenStyle.DashLine)
@@ -290,14 +418,16 @@ class ElementItem(QGraphicsPathItem):
     def boundingRect(self) -> QRectF:
         e = self.element
         if isinstance(e, NodeEl):
-            fm_w = max(len(e.text) * 8, 20)
-            c = to_scene(e.x, e.y)
-            return QRectF(c.x() - fm_w / 2 - 6, c.y() - 14, fm_w + 12, 28)
+            _, _, rect, _ = node_box(e)
+            if e.shape == "circle":
+                R = max(rect.width(), rect.height()) / 2 + 3
+                rect = QRectF(rect.center().x() - R, rect.center().y() - R,
+                              2 * R, 2 * R)
+            return node_transform(e).mapRect(rect).adjusted(-3, -3, 3, 3)
         if isinstance(e, ImageEl):
-            c = to_scene(e.x, e.y)
-            w = e.width * SCALE
-            h = w * self.canvas.image_aspect(e.path)
-            return QRectF(c.x() - w / 2, c.y() - h / 2, w, h)
+            w, h = image_display_size(e, self.canvas)
+            return image_transform(e).mapRect(
+                QRectF(-w / 2, -h / 2, w, h)).adjusted(-2, -2, 2, 2)
         if isinstance(e, LibraryEl):
             c = to_scene(e.x, e.y)
             w, h = self.canvas.lib_size_px(e.name)
@@ -327,23 +457,31 @@ class ElementItem(QGraphicsPathItem):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         if isinstance(e, NodeEl):
             painter.setOpacity(e.style.opacity)
-            r = self.boundingRect().adjusted(4, 4, -4, -4)
+            disp, font, rect, flags = node_box(e)
+            painter.save()
+            painter.setTransform(node_transform(e), True)
             if e.style.fill:
                 painter.setBrush(QBrush(qcolor_alpha(e.style.fill,
                                                      e.style.fill_opacity)))
                 painter.setPen(Qt.PenStyle.NoPen)
-                self._node_shape(painter, e, r)
+                self._node_shape(painter, e, rect)
             if e.draw_border or e.shape:
                 painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.setPen(QPen(qcolor(e.style.draw or "black"),
-                                    max(e.style.line_width * 1.6, 1.0)))
-                self._node_shape(painter, e, r)
+                painter.setPen(QPen(
+                    qcolor_alpha(e.style.draw or "black",
+                                 e.style.draw_opacity),
+                    max(e.style.line_width * 1.6, 1.0)))
+                self._node_shape(painter, e, rect)
             painter.setPen(QPen(qcolor(e.style.draw or "black")))
-            painter.setFont(QFont("DejaVu Sans", 9))
-            painter.drawText(r, Qt.AlignmentFlag.AlignCenter, e.text)
+            painter.setFont(font)
+            painter.drawText(rect.adjusted(4, 2, -4, -2), flags, disp)
+            painter.restore()
         elif isinstance(e, ImageEl):
             pm = self.canvas.image_pixmap(e.path)
-            r = self.boundingRect()
+            w, h = image_display_size(e, self.canvas)
+            r = QRectF(-w / 2, -h / 2, w, h)
+            painter.save()
+            painter.setTransform(image_transform(e), True)
             if pm:
                 painter.drawPixmap(r.toRect(), pm)
             else:
@@ -351,6 +489,7 @@ class ElementItem(QGraphicsPathItem):
                 painter.drawRect(r)
                 painter.drawText(r, Qt.AlignmentFlag.AlignCenter,
                                  os.path.basename(e.path) or "image")
+            painter.restore()
         elif isinstance(e, LibraryEl):
             pm = self.canvas.lib_pixmap(e.name)
             r = self.boundingRect()
@@ -387,24 +526,25 @@ class ElementItem(QGraphicsPathItem):
     @staticmethod
     def _node_shape(painter, e, r):
         if e.shape == "circle":
-            painter.drawEllipse(r.center(), r.height() / 2 + 4,
-                                r.height() / 2 + 4)
+            R = max(r.width(), r.height()) / 2
+            painter.drawEllipse(r.center(), R, R)
         elif e.shape == "ellipse":
             painter.drawEllipse(r)
+        elif e.shape == "diamond":
+            path = QPainterPath()
+            path.moveTo(r.center().x(), r.top() - r.height() * 0.25)
+            path.lineTo(r.right() + r.width() * 0.25, r.center().y())
+            path.lineTo(r.center().x(), r.bottom() + r.height() * 0.25)
+            path.lineTo(r.left() - r.width() * 0.25, r.center().y())
+            path.closeSubpath()
+            painter.drawPath(path)
         else:
             painter.drawRect(r)
 
-    # move -> update model -------------------------------------------------
+    # move -> update model (ALL moved items, not just the grabbed one) -----
     def mouseReleaseEvent(self, ev):
         super().mouseReleaseEvent(ev)
-        if not self.pos().isNull():
-            dx, dy = self.pos().x() / SCALE, -self.pos().y() / SCALE
-            # position was already grid-snapped live in itemChange
-            self.element.translate(round(dx, 3), round(dy, 3))
-            self.setPos(0, 0)
-            self.rebuild()
-            self.position_handles()
-            self.canvas.model_changed.emit()
+        self.canvas.commit_moved_items()
 
     def mouseDoubleClickEvent(self, ev):
         e = self.element
@@ -464,17 +604,6 @@ class GroupItem(ElementItem):
             painter.setFont(QFont("DejaVu Sans", 7))
             painter.drawText(self.boundingRect().topLeft()
                              + QPointF(2, -3), "scope")
-
-    def mouseReleaseEvent(self, ev):
-        # translation of the group's shift; the group's own scale does not
-        # affect how far the shift moves
-        QGraphicsPathItem.mouseReleaseEvent(self, ev)
-        if not self.pos().isNull():
-            dx, dy = self.pos().x() / SCALE, -self.pos().y() / SCALE
-            self.element.translate(round(dx, 3), round(dy, 3))
-            self.setPos(0, 0)
-            self.rebuild()
-            self.canvas.model_changed.emit()
 
 
 def make_item(e: Element, canvas: "Canvas") -> ElementItem:
@@ -557,9 +686,12 @@ class Canvas(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag
                          if tool == "select"
                          else QGraphicsView.DragMode.NoDrag)
-        self.status.emit(f"Tool: {tool}"
-                         + ("  (click vertices, double-click to close)"
-                            if tool == "polygon" else ""))
+        hint = ""
+        if tool == "polygon":
+            hint = "  (click vertices, double-click to close)"
+        elif tool == "multiarrow":
+            hint = "  (click waypoints, double-click to finish the arrow)"
+        self.status.emit(f"Tool: {tool}{hint}")
 
     def load_figure(self, fig: Figure):
         self.figure = fig
@@ -596,6 +728,23 @@ class Canvas(QGraphicsView):
             self._handle_owner = items[0]
         self.selection_changed.emit(items[0].element
                                     if len(items) == 1 else None)
+
+    def commit_moved_items(self):
+        """Write back every dragged item's offset into the model — a
+        multi-selection drag moves several items, but only the grabbed one
+        receives the release event."""
+        moved = False
+        for it in self._scene.items():
+            if isinstance(it, ElementItem) and it.parentItem() is None \
+                    and not it.pos().isNull():
+                dx, dy = it.pos().x() / SCALE, -it.pos().y() / SCALE
+                it.element.translate(round(dx, 3), round(dy, 3))
+                it.setPos(0, 0)
+                it.rebuild()
+                it.position_handles()
+                moved = True
+        if moved:
+            self.model_changed.emit()
 
     def delete_selected(self):
         for el in self.selected_elements():
@@ -671,7 +820,7 @@ class Canvas(QGraphicsView):
                 self._add(ImageEl(x=x, y=y, path=self._relativize(path),
                                   width=3.0))
             return
-        if self.tool == "polygon":
+        if self.tool in ("polygon", "multiarrow"):
             self._poly_pts.append((x, y))
             self._preview_poly()
             return
@@ -689,7 +838,7 @@ class Canvas(QGraphicsView):
 
     def mouseMoveEvent(self, ev):
         if self.tool == "select" or self._start is None:
-            if self.tool == "polygon" and self._poly_pts:
+            if self.tool in ("polygon", "multiarrow") and self._poly_pts:
                 self._preview_poly(self.mapToScene(ev.pos()))
             return super().mouseMoveEvent(ev)
         cur = self._snap_pt(self.mapToScene(ev.pos()))
@@ -704,7 +853,7 @@ class Canvas(QGraphicsView):
     def mouseReleaseEvent(self, ev):
         if self.tool == "select":
             return super().mouseReleaseEvent(ev)
-        if self._start is None or self.tool == "polygon":
+        if self._start is None or self.tool in ("polygon", "multiarrow"):
             return super().mouseReleaseEvent(ev)
         end = self._snap_pt(self.mapToScene(ev.pos()))
         x1, y1 = from_scene(self._start); x2, y2 = from_scene(end)
@@ -755,6 +904,14 @@ class Canvas(QGraphicsView):
             self._kill_temp()
             self._add(PolyEl(style=self.default_style.copy(),
                              points=self._poly_pts[:], closed=True))
+            self._poly_pts = []
+            return
+        if self.tool == "multiarrow" and len(self._poly_pts) >= 2:
+            self._kill_temp()
+            st = self.default_style.copy()
+            st.arrows = st.arrows or "->"
+            self._add(PolyEl(style=st, points=self._poly_pts[:],
+                             closed=False))
             self._poly_pts = []
             return
         super().mouseDoubleClickEvent(ev)

@@ -96,6 +96,17 @@ def split_top_commas(s: str) -> List[str]:
     return out
 
 
+def dim_to_cm(txt: str):
+    """'2cm' / '15mm' / '10pt' / '1in' / bare number -> cm (or None)."""
+    m = re.fullmatch(rf"\s*({NUM})\s*(cm|mm|pt|in|ex|em)?\s*", txt)
+    if not m:
+        return None
+    v = float(m.group(1))
+    unit = m.group(2) or "cm"
+    return v * {"cm": 1.0, "mm": 0.1, "pt": 0.035146, "in": 2.54,
+                "ex": 0.15, "em": 0.35}[unit]
+
+
 KNOWN_COLORS = {"black", "white", "red", "green", "blue", "cyan", "magenta",
                 "yellow", "gray", "grey", "darkgray", "lightgray", "brown",
                 "lime", "olive", "orange", "pink", "purple", "teal", "violet"}
@@ -124,6 +135,11 @@ def parse_options(opt: str, style: Style) -> List[str]:
             if m:
                 style.line_width = float(m.group(1))
             else:
+                leftovers.append(it)
+        elif low.startswith("draw opacity="):
+            try:
+                style.draw_opacity = float(it.split("=", 1)[1])
+            except ValueError:
                 leftovers.append(it)
         elif low.startswith("fill opacity="):
             try:
@@ -220,14 +236,12 @@ def _parse_statement(stmt: str) -> Optional[Element]:
                 step = float(mm.group(1))
             else:
                 kept.append(lo)
-        if kept:
-            return None
+        style.extra = kept
         g = GridEl(style=style, step=step)
         g.x1, g.y1, g.x2, g.y2 = map(float, m.groups())
         return g
 
-    if leftovers:          # unknown options -> keep raw to stay lossless
-        return None
+    style.extra = leftovers   # any other TikZ option: preserved verbatim
 
     # rectangle ------------------------------------------------------------
     m = re.fullmatch(rf"{PT}\s+rectangle\s+{PT}", rest)
@@ -321,29 +335,102 @@ def _parse_node(s: str) -> Optional[Element]:
         return None
     x, y, content = float(m.group(1)), float(m.group(2)), m.group(3)
 
-    # image node?
+    # image node? ({\includegraphics[opts]{path}})
     mi = re.fullmatch(
-        rf"\\includegraphics\[width\s*=\s*({NUM})\s*cm\]\{{(.+?)\}}",
-        content.strip())
-    if mi and not opt:
-        return ImageEl(x=x, y=y, width=float(mi.group(1)), path=mi.group(2))
+        r"\\includegraphics\s*(?:\[(?P<g>[^\]]*)\])?\{(?P<p>.+?)\}",
+        content.strip(), re.S)
+    if mi:
+        img = ImageEl(x=x, y=y, path=mi.group("p"),
+                      width=0.0, node_opts=opt.strip())
+        for it in split_top_commas(mi.group("g") or ""):
+            it = it.strip()
+            low = it.lower()
+            if low.startswith("width="):
+                d = dim_to_cm(it.split("=", 1)[1])
+                if d is not None:
+                    img.width = d
+                    continue
+            elif low.startswith("height="):
+                d = dim_to_cm(it.split("=", 1)[1])
+                if d is not None:
+                    img.height = d
+                    continue
+            elif low.startswith("scale="):
+                try:
+                    img.gscale = float(it.split("=", 1)[1]); continue
+                except ValueError:
+                    pass
+            elif low.startswith("angle="):
+                try:
+                    img.angle = float(it.split("=", 1)[1]); continue
+                except ValueError:
+                    pass
+            elif low == "keepaspectratio":
+                img.keepaspect = True
+                continue
+            if it:
+                img.gextra.append(it)
+        return img
 
     style = Style()
     leftovers = parse_options(opt, style)
-    shape, border = "", False
+    node = NodeEl(style=style, x=x, y=y, text=content)
+    POSITIONAL = {"above": "south", "below": "north", "left": "east",
+                  "right": "west",
+                  "above left": "south east", "above right": "south west",
+                  "below left": "north east", "below right": "north west"}
     kept = []
     for lo in leftovers:
+        low = lo.lower()
         if lo == "draw":
-            border = True
+            node.draw_border = True
         elif lo in ("rectangle", "circle", "ellipse", "star",
                     "diamond", "regular polygon", "cloud"):
-            shape = lo
+            node.shape = lo
+        elif low.startswith("anchor="):
+            node.anchor = lo.split("=", 1)[1].strip()
+        elif low in POSITIONAL:
+            node.anchor = POSITIONAL[low]
+        elif low.startswith("rotate="):
+            try:
+                node.rotate = float(lo.split("=", 1)[1]); continue
+            except ValueError:
+                kept.append(lo)
+        elif low.startswith("scale="):
+            try:
+                node.scale = float(lo.split("=", 1)[1]); continue
+            except ValueError:
+                kept.append(lo)
+        elif low.startswith("minimum width="):
+            d = dim_to_cm(lo.split("=", 1)[1])
+            if d is not None:
+                node.min_w = d
+            else:
+                kept.append(lo)
+        elif low.startswith("minimum height="):
+            d = dim_to_cm(lo.split("=", 1)[1])
+            if d is not None:
+                node.min_h = d
+            else:
+                kept.append(lo)
+        elif low.startswith("minimum size="):
+            d = dim_to_cm(lo.split("=", 1)[1])
+            if d is not None:
+                node.min_w = node.min_h = d
+            else:
+                kept.append(lo)
+        elif low.startswith("text width="):
+            d = dim_to_cm(lo.split("=", 1)[1])
+            if d is not None:
+                node.text_width = d
+            else:
+                kept.append(lo)
+        elif low.startswith("align="):
+            node.align = lo.split("=", 1)[1].strip()
         else:
             kept.append(lo)
-    if kept:
-        return None
-    return NodeEl(style=style, x=x, y=y, text=content,
-                  shape=shape, draw_border=border)
+    node.style.extra = kept       # everything else: preserved verbatim
+    return node
 
 
 # ----------------------------------------------------------------------
@@ -381,6 +468,12 @@ def import_tex(text: str) -> TikzDocument:
         fig.env_options = (m.group(1) or "").strip("[]")
         fig.elements = parse_body(m.group(2))
         doc.figures.append(fig)
+    if not doc.figures:
+        # bare .tikz body file (no environment): treat everything as body
+        if re.search(r"\\(draw|node|fill|path|filldraw)\b", text):
+            fig = Figure()
+            fig.elements = parse_body(text)
+            doc.figures.append(fig)
     if not doc.figures:
         doc.figures = [Figure()]
     return doc

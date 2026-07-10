@@ -32,6 +32,8 @@ class Style:
     arrows: str = ""           # "" | -> | <- | <->
     opacity: float = 1.0
     fill_opacity: float = 1.0
+    draw_opacity: float = 1.0
+    extra: List[str] = field(default_factory=list)  # preserved verbatim
 
     def options(self, extra: List[str] = None) -> str:
         o: List[str] = []
@@ -49,14 +51,19 @@ class Style:
             o.append(f"opacity={fnum(self.opacity)}")
         if self.fill_opacity < 0.999:
             o.append(f"fill opacity={fnum(self.fill_opacity)}")
+        if self.draw_opacity < 0.999:
+            o.append(f"draw opacity={fnum(self.draw_opacity)}")
         if extra:
             o.extend(extra)
+        if self.extra:
+            o.extend(self.extra)
         return f"[{', '.join(o)}]" if o else ""
 
     def copy(self) -> "Style":
         return Style(self.draw, self.fill, self.line_width,
                      self.dash, self.arrows, self.opacity,
-                     self.fill_opacity)
+                     self.fill_opacity, self.draw_opacity,
+                     list(self.extra))
 
 
 # ----------------------------------------------------------------------
@@ -349,8 +356,15 @@ class GridEl(Element):
 class NodeEl(Element):
     x: float = 0; y: float = 0
     text: str = "text"
-    shape: str = ""          # "", rectangle, circle, ellipse, star, cloud callout ...
+    shape: str = ""          # "", rectangle, circle, ellipse, star, ...
     draw_border: bool = False
+    anchor: str = ""         # west, north east, ...
+    scale: float = 1.0
+    rotate: float = 0.0
+    min_w: float = 0.0       # minimum width  (cm)
+    min_h: float = 0.0       # minimum height (cm)
+    text_width: float = 0.0  # cm (enables wrapping)
+    align: str = ""          # left | center | right
 
     def to_tikz(self):
         extra = []
@@ -358,7 +372,22 @@ class NodeEl(Element):
             extra.append(self.shape)
         if self.draw_border or self.shape:
             extra.append("draw")
-        opts = self.style.options(extra) if (extra or self.style.options()) else ""
+        if self.anchor:
+            extra.append(f"anchor={self.anchor}")
+        if abs(self.rotate) > 1e-9:
+            extra.append(f"rotate={fnum(self.rotate)}")
+        if abs(self.scale - 1) > 1e-9:
+            extra.append(f"scale={fnum(self.scale)}")
+        if self.min_w > 0:
+            extra.append(f"minimum width={fnum(self.min_w)}cm")
+        if self.min_h > 0:
+            extra.append(f"minimum height={fnum(self.min_h)}cm")
+        if self.text_width > 0:
+            extra.append(f"text width={fnum(self.text_width)}cm")
+        if self.align:
+            extra.append(f"align={self.align}")
+        opts = self.style.options(extra) \
+            if (extra or self.style.options()) else ""
         return f"\\node{opts} at ({fnum(self.x)},{fnum(self.y)}) {{{self.text}}};"
 
     def translate(self, dx, dy):
@@ -373,11 +402,31 @@ class NodeEl(Element):
 class ImageEl(Element):
     x: float = 0; y: float = 0
     path: str = ""
-    width: float = 3.0  # cm
+    width: float = 3.0      # cm; 0 = unset
+    height: float = 0.0     # cm; 0 = unset
+    gscale: float = 0.0     # graphicx scale=; 0 = unset
+    angle: float = 0.0      # graphicx angle= (degrees, CCW)
+    keepaspect: bool = False
+    gextra: List[str] = field(default_factory=list)  # other graphicx opts
+    node_opts: str = ""     # options of the wrapping \\node, verbatim
 
     def to_tikz(self):
-        return (f"\\node at ({fnum(self.x)},{fnum(self.y)})"
-                f" {{\\includegraphics[width={fnum(self.width)}cm]{{{self.path}}}}};")
+        g = []
+        if self.width > 0:
+            g.append(f"width={fnum(self.width)}cm")
+        if self.height > 0:
+            g.append(f"height={fnum(self.height)}cm")
+        if self.keepaspect:
+            g.append("keepaspectratio")
+        if self.gscale > 0:
+            g.append(f"scale={fnum(self.gscale)}")
+        if abs(self.angle) > 1e-9:
+            g.append(f"angle={fnum(self.angle)}")
+        g.extend(self.gextra)
+        gopt = f"[{', '.join(g)}]" if g else ""
+        nopt = f"[{self.node_opts}]" if self.node_opts else ""
+        return (f"\\node{nopt} at ({fnum(self.x)},{fnum(self.y)})"
+                f" {{\\includegraphics{gopt}{{{self.path}}}}};")
 
     def translate(self, dx, dy):
         self.x += dx; self.y += dy

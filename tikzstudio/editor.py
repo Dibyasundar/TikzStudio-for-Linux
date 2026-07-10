@@ -20,7 +20,23 @@ TIKZ_KEYWORDS = [
     "red", "blue", "green", "orange", "purple", "gray", "black", "white",
     "yellow", "cyan", "magenta", "brown", "teal", "violet", "pink",
     "star", "regular polygon", "ellipse callout", "cloud callout",
-    "minimum width=", "minimum height=", "text width=", "align=center",
+    "minimum width=", "minimum height=", "minimum size=", "text width=",
+    "align=center", "align=left", "align=right", "anchor=west",
+    "anchor=east", "anchor=north", "anchor=south", "anchor=center",
+    "anchor=north east", "anchor=north west", "anchor=south east",
+    "anchor=south west", "rounded corners", "rounded corners=8pt",
+    "fill opacity=", "draw opacity=", "line cap=round", "line join=round",
+    "dash pattern=on 4pt off 2pt", "double", "double distance=",
+    "decorate", "decoration=snake", "decoration=zigzag",
+    "decoration={coil, aspect=0.6}", "decoration={brace, amplitude=6pt}",
+    "\\includegraphics[width=3cm]{}", "width=", "height=",
+    "keepaspectratio", "angle=", "\\begin{scope}", "\\end{scope}",
+    "shift={(0,0)}", "inner sep=", "outer sep=", "circle callout",
+    "cloud callout", "single arrow", "double arrow", "starburst",
+    "regular polygon sides=", "star points=", "aspect=",
+    "\\usetikzlibrary{}", "\\usepackage{}", "smooth", "tension=",
+    "domain=", "samples=", "variable=", "loop above", "loop below",
+    "bend left", "bend right", "out=", "in=", "pos=0.5", "sloped",
 ]
 
 
@@ -101,24 +117,96 @@ class TikzEditor(QPlainTextEdit):
         self.setTextCursor(tc)
 
     def keyPressEvent(self, ev):
+        ctrl = ev.modifiers() & Qt.KeyboardModifier.ControlModifier
         if self.completer.popup().isVisible() and ev.key() in (
                 Qt.Key.Key_Enter, Qt.Key.Key_Return, Qt.Key.Key_Tab,
                 Qt.Key.Key_Escape):
             ev.ignore()
             return
-        if (ev.key() == Qt.Key.Key_Space
-                and ev.modifiers() & Qt.KeyboardModifier.ControlModifier):
+        if ctrl and ev.key() == Qt.Key.Key_Space:
             self._popup_completions()
             return
+        if ctrl and ev.key() == Qt.Key.Key_T:        # comment selection
+            self._comment_selection(True)
+            return
+        if ctrl and ev.key() == Qt.Key.Key_R:        # uncomment selection
+            self._comment_selection(False)
+            return
+        if ctrl and ev.key() == Qt.Key.Key_F:        # find
+            self._find_dialog()
+            return
+        if ev.key() == Qt.Key.Key_F3:                # find next / previous
+            self._find_next(backwards=bool(
+                ev.modifiers() & Qt.KeyboardModifier.ShiftModifier))
+            return
         super().keyPressEvent(ev)
+        # auto-suggest while typing: commands after '\\' AND plain
+        # option/tag words (2+ letters)
         prefix = self._word_under_cursor()
-        if prefix.startswith("\\") and len(prefix) >= 2:
+        if ev.text() and (prefix.startswith("\\") and len(prefix) >= 2
+                          or (not prefix.startswith("\\")
+                              and len(prefix) >= 2)):
             self._popup_completions()
         elif self.completer.popup().isVisible():
             if len(prefix) < 1:
                 self.completer.popup().hide()
             else:
                 self.completer.setCompletionPrefix(prefix)
+
+    # -- comment / uncomment selected lines (Ctrl+T / Ctrl+R) ---------------
+    def _comment_selection(self, add: bool):
+        tc = self.textCursor()
+        doc = self.document()
+        start, end = tc.selectionStart(), tc.selectionEnd()
+        first = doc.findBlock(start)
+        last = doc.findBlock(end if end == start else end - 1)
+        tc.beginEditBlock()
+        block = first
+        while block.isValid():
+            text = block.text()
+            cur = QTextCursor(block)
+            if add:
+                if text.strip():
+                    cur.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+                    cur.insertText("% ")
+            else:
+                stripped = text.lstrip()
+                if stripped.startswith("%"):
+                    lead = len(text) - len(stripped)
+                    drop = 1
+                    if stripped[1:2] == " ":
+                        drop = 2
+                    cur.setPosition(block.position() + lead)
+                    cur.setPosition(block.position() + lead + drop,
+                                    QTextCursor.MoveMode.KeepAnchor)
+                    cur.removeSelectedText()
+            if block == last:
+                break
+            block = block.next()
+        tc.endEditBlock()
+
+    # -- find (Ctrl+F, F3 / Shift+F3) ---------------------------------------
+    def _find_dialog(self):
+        from PyQt6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getText(self, "Find", "Find text:",
+                                        text=getattr(self, "_find_q", ""))
+        if ok and text:
+            self._find_q = text
+            self._find_next()
+
+    def _find_next(self, backwards=False):
+        q = getattr(self, "_find_q", "")
+        if not q:
+            return
+        from PyQt6.QtGui import QTextDocument
+        flags = QTextDocument.FindFlag.FindBackward if backwards \
+            else QTextDocument.FindFlag(0)
+        if not self.find(q, flags):
+            cur = self.textCursor()
+            cur.movePosition(QTextCursor.MoveOperation.End if backwards
+                             else QTextCursor.MoveOperation.Start)
+            self.setTextCursor(cur)
+            self.find(q, flags)
 
     def _popup_completions(self):
         prefix = self._word_under_cursor()
