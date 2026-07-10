@@ -1,3 +1,5 @@
+**This project aims to develop a native Linux interface inspired by TikZedit. Please note that the majority of the codebase was generated using Claude's Fabel AI model. The software is currently under active development and is provided "as is," so please use it at your own discretion. We anticipate rolling out new version releases in the near future.**
+
 # TikZ Studio
 
 A WYSIWYG desktop editor for TikZ/LaTeX diagrams on Linux, with **live
