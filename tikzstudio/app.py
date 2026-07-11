@@ -1508,19 +1508,21 @@ class MainWindow(QMainWindow):
         for pkg in sh.packages:
             if pkg not in self.doc.packages:
                 self.doc.packages.append(pkg)
-        if sh.custom:
-            # custom snippets are inserted as plain TikZ (no % lib: marker)
-            # so they behave as a normal scope: scalable, rotatable,
-            # fully editable in code
-            from .elements import fnum
-            code = (sh.template.replace("@X@", fnum(x))
-                    .replace("@Y@", fnum(y)))
-            new_els = parse_body(code)
-            self.fig().elements.extend(new_els)
-        else:
-            new_els = [LibraryEl(name=sh.name, template=sh.template,
-                                 x=x, y=y)]
-            self.fig().elements.extend(new_els)
+        # every palette element inserts as plain TikZ (no % lib: marker):
+        # the code stays fully editable and the canvas redraws it from
+        # its actual statements (node shapes, decorations, scopes, ...)
+        from .elements import fnum
+        code = (sh.template.replace("@X@", fnum(x))
+                .replace("@Y@", fnum(y)))
+        new_els = parse_body(code)
+        self.fig().elements.extend(new_els)
+        # the element's TikZ libraries move into the document preamble
+        for libname in sh.libraries:
+            if libname not in self.doc.tikz_libraries:
+                self.doc.tikz_libraries.append(libname)
+        for pkg in sh.packages:
+            if pkg not in self.doc.packages:
+                self.doc.packages.append(pkg)
         self.canvas.rebuild_scene()
         from .canvas import ElementItem
         for it in self.canvas.scene().items():
@@ -1531,6 +1533,45 @@ class MainWindow(QMainWindow):
         self._push_history()
         if self.auto_cb.isChecked():
             self._auto_timer.start()
+
+    COMMON_TIKZ_LIBS = [
+        "shapes.geometric", "shapes.symbols", "shapes.callouts",
+        "shapes.arrows", "shapes.misc", "shapes.multipart",
+        "arrows.meta", "decorations.pathmorphing",
+        "decorations.pathreplacing", "decorations.text",
+        "decorations.markings", "patterns", "calc", "positioning",
+        "fit", "backgrounds", "matrix", "trees", "mindmap",
+        "circuits.ee.IEC", "circuits.logic.US", "3d", "shadows",
+        "fadings", "intersections", "angles", "quotes", "babel",
+    ]
+    COMMON_PACKAGES = [
+        "pgfplots", "amsmath", "amssymb", "xcolor", "graphicx",
+        "tikz-3dplot", "siunitx", "bm", "mathtools", "chemfig",
+    ]
+
+    @staticmethod
+    def _attach_quick_add(line_edit, choices, tooltip):
+        """A ⊞ button that appends common entries to a comma list."""
+        btn = QToolButton()
+        btn.setText("⊞")
+        btn.setToolTip(tooltip)
+        menu = QMenu(btn)
+        def _add(name):
+            cur = [t.strip() for t in line_edit.text().split(",")
+                   if t.strip()]
+            if name not in cur:
+                cur.append(name)
+                line_edit.setText(", ".join(cur))
+        for name in choices:
+            menu.addAction(name, lambda n=name: _add(n))
+        btn.setMenu(menu)
+        btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(line_edit, 1)
+        row.addWidget(btn)
+        holder = QWidget(); holder.setLayout(row)
+        return holder
 
     def _add_custom_element(self):
         dlg = QDialog(self)
@@ -1551,8 +1592,12 @@ class MainWindow(QMainWindow):
         group_e.setToolTip("Palette group for this element — type a new "
                            "name to create a group")
         form.addRow("Name:", name_e)
-        form.addRow("TikZ libraries:", libs_e)
-        form.addRow("Packages:", pkgs_e)
+        form.addRow("TikZ libraries:", self._attach_quick_add(
+            libs_e, self.COMMON_TIKZ_LIBS,
+            "Add a common TikZ library (comma-separated list)"))
+        form.addRow("Packages:", self._attach_quick_add(
+            pkgs_e, self.COMMON_PACKAGES,
+            "Add a common LaTeX package (comma-separated list)"))
         form.addRow("Group:", group_e)
         lay.addLayout(form)
         hint = QLabel(
@@ -1757,6 +1802,14 @@ class MainWindow(QMainWindow):
                   "trapezium": "shapes.geometric",
                   "cylinder": "shapes.geometric",
                   "kite": "shapes.geometric", "dart": "shapes.geometric",
+                  "circular sector": "shapes.geometric",
+                  "semicircle": "shapes.geometric",
+                  "rounded rectangle": "shapes.misc",
+                  "chamfered rectangle": "shapes.misc",
+                  "cross out": "shapes.misc",
+                  "arrow box": "shapes.arrows",
+                  "forbidden sign": "shapes.symbols",
+                  "magnifying glass": "shapes.symbols",
                   "cloud": "shapes.symbols", "signal": "shapes.symbols",
                   "tape": "shapes.symbols",
                   "starburst": "shapes.symbols",

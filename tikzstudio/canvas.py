@@ -655,6 +655,7 @@ class ElementItem(QGraphicsPathItem):
 
     # ------------------------------------------------------------------
     def rebuild(self):
+        self.prepareGeometryChange()      # avoid ghost artefacts
         e = self.element
         st = e.style
         pgf = self.pgf
@@ -1006,11 +1007,79 @@ class ElementItem(QGraphicsPathItem):
                 pt = QPointF(cx + R * math.cos(a), cy + R * math.sin(a))
                 path.moveTo(pt) if i == 0 else path.lineTo(pt)
         elif e.shape == "trapezium":
-            inset = w * 0.22
-            path.moveTo(r.left() - inset, r.bottom())
-            path.lineTo(r.right() + inset, r.bottom())
-            path.lineTo(r.right(), r.top())
-            path.lineTo(r.left(), r.top())
+            aL = math.radians(e.trap_l or 60)
+            aR = math.radians(180 - (e.trap_r or 120))
+            iL = min(abs(h / math.tan(aL)) if abs(math.tan(aL)) > 1e-6
+                     else 0, w * 0.45) * (1 if e.trap_l == 0
+                                          or e.trap_l < 90 else -1)
+            iR = min(abs(h / math.tan(aR)) if abs(math.tan(aR)) > 1e-6
+                     else 0, w * 0.45) * (1 if e.trap_r == 0
+                                          or e.trap_r > 90 else -1)
+            path.moveTo(r.left(), r.bottom())
+            path.lineTo(r.right(), r.bottom())
+            path.lineTo(r.right() - iR, r.top())
+            path.lineTo(r.left() + iL, r.top())
+        elif e.shape == "rounded rectangle":
+            rad = h / 2
+            path.addRoundedRect(r, rad, rad)
+            painter.drawPath(path)
+            return
+        elif e.shape == "chamfered rectangle":
+            c = min(w, h) * 0.25
+            path.moveTo(r.left() + c, r.top())
+            path.lineTo(r.right() - c, r.top())
+            path.lineTo(r.right(), r.top() + c)
+            path.lineTo(r.right(), r.bottom() - c)
+            path.lineTo(r.right() - c, r.bottom())
+            path.lineTo(r.left() + c, r.bottom())
+            path.lineTo(r.left(), r.bottom() - c)
+            path.lineTo(r.left(), r.top() + c)
+        elif e.shape == "cross out":
+            # an X drawn across the node
+            path.moveTo(r.topLeft()); path.lineTo(r.bottomRight())
+            path.moveTo(r.topRight()); path.lineTo(r.bottomLeft())
+            painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+            painter.drawPath(path)
+            return
+        elif e.shape == "arrow box":
+            painter.drawRect(r)
+            a = min(w, h) * 0.35        # arrow length outside the box
+            b = min(w, h) * 0.22        # arrow half-width
+            for (sx, sy, dx, dy) in ((cx, r.top(), 0, -1),
+                                     (cx, r.bottom(), 0, 1),
+                                     (r.left(), cy, -1, 0),
+                                     (r.right(), cy, 1, 0)):
+                ar = QPainterPath()
+                ar.moveTo(sx + dx * a, sy + dy * a)
+                ar.lineTo(sx + dy * b, sy + dx * b)
+                ar.lineTo(sx - dy * b, sy - dx * b)
+                ar.closeSubpath()
+                painter.drawPath(ar)
+            return
+        elif e.shape == "circular sector":
+            R = max(w, h) * 0.75
+            path.moveTo(cx, cy + R * 0.35)
+            path.arcTo(cx - R, cy + R * 0.35 - R, 2 * R, 2 * R, 60, 60)
+            path.closeSubpath()
+        elif e.shape == "semicircle":
+            R = max(w, h) * 0.62
+            path.moveTo(cx - R, cy + R * 0.4)
+            path.arcTo(cx - R, cy + R * 0.4 - R, 2 * R, 2 * R, 180, -180)
+            path.closeSubpath()
+        elif e.shape == "forbidden sign":
+            R = max(w, h) * 0.7
+            painter.drawEllipse(QPointF(cx, cy), R, R)
+            d = R / math.sqrt(2)
+            painter.drawLine(QPointF(cx - d, cy - d),
+                             QPointF(cx + d, cy + d))
+            return
+        elif e.shape == "magnifying glass":
+            R = max(w, h) * 0.6
+            painter.drawEllipse(QPointF(cx, cy), R, R)
+            d = R / math.sqrt(2)
+            painter.drawLine(QPointF(cx + d, cy + d),
+                             QPointF(cx + d + R * 0.8, cy + d + R * 0.8))
+            return
         elif e.shape == "signal":
             d = w * 0.25
             path.moveTo(r.left(), r.top())
@@ -1058,12 +1127,15 @@ class ElementItem(QGraphicsPathItem):
                 bubble.addRect(r)
             elif e.shape == "cloud callout":
                 k = 5
+                asp = e.aspect or 1.0
+                ry = h * 0.32
+                rx = min(ry * asp, w * 0.45)
                 for i in range(k):
                     a = i * 2 * math.pi / k
                     bubble.addEllipse(
                         QPointF(cx + w * 0.32 * math.cos(a),
-                                cy + h * 0.32 * math.sin(a)),
-                        w * 0.32, h * 0.32)
+                                cy + h * 0.28 * math.sin(a)),
+                        rx, ry)
                 bubble = bubble.simplified()
             else:
                 bubble.addEllipse(r.adjusted(-w * 0.12, -h * 0.12,
@@ -1090,11 +1162,14 @@ class ElementItem(QGraphicsPathItem):
             return
         elif e.shape == "cloud":
             k = 5
+            asp = e.aspect or 1.0
+            ry = h * 0.32
+            rx = min(ry * asp, w * 0.48)
             for i in range(k):
                 a = i * 2 * math.pi / k
                 bx = cx + w * 0.32 * math.cos(a)
-                by = cy + h * 0.32 * math.sin(a)
-                path.addEllipse(QPointF(bx, by), w * 0.32, h * 0.32)
+                by = cy + h * 0.28 * math.sin(a)
+                path.addEllipse(QPointF(bx, by), rx, ry)
             path = path.simplified()
         else:
             painter.drawRect(r)
@@ -1124,6 +1199,7 @@ class ElementItem(QGraphicsPathItem):
 # ----------------------------------------------------------------------
 class GroupItem(ElementItem):
     def rebuild(self):
+        self.prepareGeometryChange()      # avoid ghost artefacts
         e: GroupEl = self.element
         # remove previous child element items (keep handles machinery empty)
         for ch in list(self.childItems()):
@@ -1173,6 +1249,7 @@ class LibraryItem(ElementItem):
     the cached thumbnail is only a fallback for unparseable snippets."""
 
     def rebuild(self):
+        self.prepareGeometryChange()      # avoid ghost artefacts
         from .parser import parse_body
         e: LibraryEl = self.element
         for ch in list(self.childItems()):
@@ -1348,6 +1425,10 @@ class Canvas(QGraphicsView):
         self._scene = QGraphicsScene(-2000, -2000, 4000, 4000)
         self.setScene(self._scene)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # full-viewport repaints kill the "ghost trail" artefacts left by
+        # moving items / handles with partial updates
+        self.setViewportUpdateMode(
+            QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         # multi-select picks WHOLE elements only (fully inside the band);
         # configurable via set_selection_mode()
@@ -1493,13 +1574,13 @@ class Canvas(QGraphicsView):
                    if a is not None]
         vp = self.viewport().mapFromGlobal(QCursor.pos())
         if self.viewport().rect().contains(vp):
-            sp = self._snap_pt(self.mapToScene(vp))
-            cx, cy = from_scene(sp)
+            cx, cy = from_scene(self.mapToScene(vp))
         else:
             cx, cy = self._last_mouse
-            if self.snap:
-                g = max(self.grid_step, 0.01)
-                cx, cy = round(cx / g) * g, round(cy / g) * g
+        # paste always lands on the nearest grid point (independent of
+        # the snap toggle) so pasted copies line up with the canvas grid
+        g = max(self.grid_step, 0.01)
+        cx, cy = round(cx / g) * g, round(cy / g) * g
         if anchors:
             ax = sum(a[0] for a in anchors) / len(anchors)
             ay = sum(a[1] for a in anchors) / len(anchors)

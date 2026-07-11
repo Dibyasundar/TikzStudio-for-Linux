@@ -382,6 +382,9 @@ class NodeEl(Element):
     shape: str = ""          # "", rectangle, circle, ellipse, star, ...
     star_points: int = 0     # star points= (0 = default 5)
     poly_sides: int = 0      # regular polygon sides=
+    aspect: float = 0.0      # cloud/callout aspect= (0 = default)
+    trap_l: float = 0.0      # trapezium left angle= (0 = default 60)
+    trap_r: float = 0.0      # trapezium right angle= (0 = default 120)
     inner_sep: float = -1.0  # cm; <0 = TikZ default
     has_ptr: bool = False    # callout pointer
     ptr_rel: bool = False
@@ -400,6 +403,12 @@ class NodeEl(Element):
         extra = []
         if self.shape:
             extra.append(self.shape)
+        if self.aspect:
+            extra.append(f"aspect={fnum(self.aspect)}")
+        if self.trap_l:
+            extra.append(f"trapezium left angle={fnum(self.trap_l)}")
+        if self.trap_r:
+            extra.append(f"trapezium right angle={fnum(self.trap_r)}")
         if self.star_points:
             extra.append(f"star points={self.star_points}")
         if self.poly_sides:

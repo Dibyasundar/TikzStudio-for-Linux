@@ -641,8 +641,27 @@ def _parse_node(s: str) -> Optional[Element]:
                     "single arrow", "double arrow", "trapezium",
                     "signal", "tape", "starburst", "cylinder",
                     "kite", "dart", "ellipse callout",
-                    "rectangle callout", "cloud callout"):
+                    "rectangle callout", "cloud callout",
+                    "arrow box", "rounded rectangle",
+                    "chamfered rectangle", "cross out",
+                    "circular sector", "semicircle",
+                    "forbidden sign", "magnifying glass"):
             node.shape = lo
+        elif low.startswith("aspect="):
+            try:
+                node.aspect = float(lo.split("=", 1)[1]); continue
+            except ValueError:
+                kept.append(lo)
+        elif low.startswith("trapezium left angle="):
+            try:
+                node.trap_l = float(lo.split("=", 1)[1]); continue
+            except ValueError:
+                kept.append(lo)
+        elif low.startswith("trapezium right angle="):
+            try:
+                node.trap_r = float(lo.split("=", 1)[1]); continue
+            except ValueError:
+                kept.append(lo)
         elif low.startswith("star points="):
             try:
                 node.star_points = int(lo.split("=", 1)[1]); continue

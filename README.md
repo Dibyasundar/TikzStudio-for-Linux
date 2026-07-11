@@ -1,15 +1,9 @@
 **This project aims to develop a native Linux interface inspired by TikZedit. Please note that the majority of the codebase was generated using Claude's Fabel AI model. The software is currently under active development and is provided "as is," so please use it at your own discretion. We anticipate rolling out new version releases in the near future.**
 
-
-# TikZ Studio
-
-A WYSIWYG desktop editor for TikZ/LaTeX diagrams on Linux, with **live
-two-way synchronization** between a visual canvas and the TikZ source code.
-
 ## Install (Debian/Ubuntu)
 
 ```bash
-sudo apt install ./tikzstudio_1.8.0_all.deb
+sudo apt install ./tikzstudio_1.9.0_all.deb
 ```
 
 This pulls in the dependencies automatically: `python3-pyqt6`,
@@ -41,6 +35,22 @@ Launch from the application menu (**TikZ Studio**) or run `tikzstudio`.
   appears in the palette permanently (marked ★).
 
 **Visual canvas (left/center)**
+- **Even more node shapes rendered**: arrow box, rounded rectangle
+  (stadium), chamfered rectangle, cross out, circular sector,
+  semicircle, forbidden sign, magnifying glass — plus `aspect=` on
+  clouds/callouts and `trapezium left/right angle=`. All parse,
+  render, round-trip, and pull their TikZ libraries into the preamble
+  automatically.
+- **Marker-free placement**: palette elements (built-in AND custom)
+  now insert their plain TikZ code — no `% lib:` comments — so every
+  placed element is a real, fully editable node/path/scope with
+  working properties. Old files with markers still load fine.
+- **No more ghosting**: the canvas uses full-viewport repaints and
+  proper geometry-change notifications, eliminating the trail
+  artefacts left when dragging elements or handles.
+- **Grid-aligned paste**: Ctrl+Shift+V always lands the pasted
+  selection's centroid on the nearest canvas grid point, regardless of
+  the snap toggle.
 - **pgfplots**: *Insert ▸ PGF plot (axis)…* offers line, function,
   scatter and bar templates, inserted as `\sbox{\tzsplot}{…}` +
   `\node` (the recommended embedding that avoids nested-picture
@@ -159,7 +169,9 @@ Launch from the application menu (**TikZ Studio**) or run `tikzstudio`.
   app updates (old caches migrate automatically).
 - **Element palette**: live search box; ⇪/⇩ buttons export/import
   custom elements (with groups and thumbnails) as portable `.tikzlib`
-  bundles for sharing between machines. Custom elements are inserted
+  bundles for sharing between machines. The custom-element dialog has
+  ⊞ quick-add menus with ~25 common TikZ libraries and ~10 packages so
+  you never have to remember library names. Custom elements are inserted
   as plain TikZ scopes (no `% lib:` marker) so they scale, rotate and
   edit like any group; the library rebuilds itself automatically if
   its cache is corrupted or thumbnails go missing.
