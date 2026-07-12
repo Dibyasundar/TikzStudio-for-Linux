@@ -8,7 +8,8 @@ import subprocess
 from PyQt6.QtCore import Qt, QTimer, QThread, QSize, QSettings, QSettings
 from PyQt6.QtGui import (QAction, QKeySequence, QPixmap, QColor,
                          QActionGroup, QIcon, QPainter, QFont)
-from PyQt6.QtWidgets import (QMainWindow, QToolBar, QDockWidget, QLabel,
+from PyQt6.QtWidgets import (QListWidget, QListWidgetItem,
+                             QPlainTextEdit, QMainWindow, QToolBar, QDockWidget, QLabel,
                              QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QTabBar, QFileDialog, QMessageBox, QComboBox,
                              QDoubleSpinBox, QFormLayout, QCheckBox,
@@ -130,6 +131,7 @@ class MainWindow(QMainWindow):
         self._build_panels()
         self._build_menus()
         self._init_library()
+        self.load_plugins()
         self._load_settings()
         self._update_file_label()
         self._refresh_fig_tabs()
@@ -384,6 +386,12 @@ class MainWindow(QMainWindow):
         st.sync()
 
     def closeEvent(self, ev):
+        # cancel any queued/in-flight plot compile so pdflatex is not
+        # orphaned when the app exits.
+        try:
+            self.canvas.stop_plot_worker()
+        except Exception:
+            pass
         self._save_settings()
         super().closeEvent(ev)
 
@@ -684,6 +692,20 @@ class MainWindow(QMainWindow):
 
         b = m.addMenu("&Build")
         b.addAction(self.compile_action)
+
+        pm = m.addMenu("&Plugins")
+        pm.addAction(self._act("Run plugin…", "Ctrl+P",
+                               self.plugin_palette))
+        pm.addAction(self._act("New plugin… (shows template)", None,
+                               self.new_plugin))
+        pm.addAction(self._act("Reload plugins", None, lambda: (
+            self.load_plugins(),
+            self.statusBar().showMessage(
+                f"{len(self._plugins)} plugin(s) loaded.", 4000))))
+        pm.addAction(self._act("Open plugins folder path…", None,
+                               lambda: QMessageBox.information(
+                                   self, "Plugins folder",
+                                   self.plugins_dir())))
 
         sm = m.addMenu("&Settings")
         self.act_auto_select = QAction(
@@ -1778,6 +1800,182 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             "Plot inserted — the canvas preview compiles in the "
             "background; press F5 for the full PDF.", 6000)
+
+
+    # ==================================================================
+    # Python plugins (~/.local/share/tikzstudio/plugins/*.py)
+    # ==================================================================
+    PLUGIN_TEMPLATE = '''"""{name} — a TikZ Studio plugin.
+
+Every plugin is a Python file in the plugins folder defining:
+
+  NAME         - display name shown in the plugin list (Ctrl+P)
+  DESCRIPTION  - one line shown next to the name
+  run(app)     - called when the plugin is invoked
+
+Inside run(app) you can use:
+  app.fig()                     the active Figure (has .elements)
+  app.doc                       the TikzDocument (preamble, packages)
+  app.canvas                    the canvas (rebuild_scene(), ...)
+  parse_body("<tikz code>")     turn TikZ code into elements
+  app.plugin_refresh()          push changes to canvas + editor + undo
+
+Return a string to show it in the status bar.
+"""
+
+from tikzstudio.parser import parse_body
+
+NAME = "{name}"
+DESCRIPTION = "Describe what this plugin does."
+
+
+def run(app):
+    # Example: add a small labelled axis cross at the origin
+    app.fig().elements.extend(parse_body(
+        "\\\\draw[->, thick] (0,0) -- (3,0) node[right] {{$x$}};\\n"
+        "\\\\draw[->, thick] (0,0) -- (0,3) node[above] {{$y$}};"))
+    app.plugin_refresh()
+    return "{name}: axis inserted."
+'''
+
+    @staticmethod
+    def plugins_dir():
+        from .library import DATA_DIR
+        d = os.path.join(DATA_DIR, "plugins")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def load_plugins(self):
+        """(Re)load every plugin file. Returns {name: module}."""
+        import importlib.util
+        self._plugins = {}
+        for fn in sorted(os.listdir(self.plugins_dir())):
+            if not fn.endswith(".py") or fn.startswith("_"):
+                continue
+            path = os.path.join(self.plugins_dir(), fn)
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    "tzs_plugin_" + fn[:-3], path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                if hasattr(mod, "run"):
+                    name = getattr(mod, "NAME", fn[:-3])
+                    mod.__plugin_file__ = path
+                    self._plugins[name] = mod
+            except Exception as exc:
+                self.statusBar().showMessage(
+                    f"Plugin {fn} failed to load: {exc}", 8000)
+        return self._plugins
+
+    def plugin_refresh(self):
+        """For plugins: sync canvas, editor and history after edits."""
+        self.canvas.rebuild_scene()
+        self._push_code_to_editor()
+        self._push_history()
+
+    def new_plugin(self):
+        name, ok = QInputDialog.getText(self, "New plugin",
+                                        "Plugin name:")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        safe = re.sub(r"[^a-zA-Z0-9_]+", "_", name.lower()) or "plugin"
+        path = os.path.join(self.plugins_dir(), safe + ".py")
+        i = 2
+        while os.path.exists(path):
+            path = os.path.join(self.plugins_dir(), f"{safe}_{i}.py")
+            i += 1
+        code = self.PLUGIN_TEMPLATE.format(name=name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(code)
+        self.load_plugins()
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Plugin created — {os.path.basename(path)}")
+        lay = QVBoxLayout(dlg)
+        info = QLabel(f"Saved to: {path}\nEdit it with any editor, then "
+                      "run it with Ctrl+P. Use Plugins ▸ Reload after "
+                      "changes.")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        viewer = QPlainTextEdit()
+        viewer.setPlainText(code)
+        viewer.setStyleSheet("font-family: Monospace; font-size: 11px;")
+        lay.addWidget(viewer, 1)
+        row = QHBoxLayout()
+        save = QPushButton("Save changes")
+        def _save():
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(viewer.toPlainText())
+            self.load_plugins()
+            self.statusBar().showMessage(f"Saved {path}.", 4000)
+        save.clicked.connect(_save)
+        close = QPushButton("Close")
+        close.clicked.connect(dlg.accept)
+        row.addStretch(); row.addWidget(save); row.addWidget(close)
+        lay.addLayout(row)
+        dlg.resize(620, 480)
+        dlg.exec()
+
+    def plugin_palette(self):
+        """Ctrl+P: searchable popup listing all plugins; Enter runs."""
+        if not getattr(self, "_plugins", None):
+            self.load_plugins()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Run plugin  (type to filter)")
+        lay = QVBoxLayout(dlg)
+        search = QLineEdit()
+        search.setPlaceholderText("🔍 filter plugins…")
+        lay.addWidget(search)
+        lst = QListWidget()
+        lay.addWidget(lst, 1)
+        hint = QLabel("Enter / double-click runs the plugin. "
+                      "Plugins ▸ New plugin… creates one from a template.")
+        hint.setStyleSheet("color:#6b7280; font-size:11px;")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        def fill(query=""):
+            lst.clear()
+            q = query.strip().lower()
+            for name, mod in sorted(self._plugins.items()):
+                desc = getattr(mod, "DESCRIPTION", "")
+                if q and q not in name.lower() and q not in desc.lower():
+                    continue
+                it = QListWidgetItem(f"{name} — {desc}" if desc else name)
+                it.setData(Qt.ItemDataRole.UserRole, name)
+                lst.addItem(it)
+            if lst.count():
+                lst.setCurrentRow(0)
+        fill()
+        search.textChanged.connect(fill)
+
+        def run_current():
+            it = lst.currentItem()
+            if it is None:
+                return
+            dlg.accept()
+            self.run_plugin(it.data(Qt.ItemDataRole.UserRole))
+        lst.itemDoubleClicked.connect(lambda _: run_current())
+        search.returnPressed.connect(run_current)
+        if not self._plugins:
+            lst.addItem("No plugins yet — Plugins ▸ New plugin… to "
+                        "create one.")
+        search.setFocus()
+        dlg.resize(460, 360)
+        dlg.exec()
+
+    def run_plugin(self, name):
+        mod = self._plugins.get(name)
+        if mod is None:
+            return
+        try:
+            msg = mod.run(self)
+            if msg:
+                self.statusBar().showMessage(str(msg), 6000)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Plugin error",
+                f"Plugin '{name}' raised:\n{type(exc).__name__}: {exc}")
 
     def _insert_image(self):
         path, _ = QFileDialog.getOpenFileName(

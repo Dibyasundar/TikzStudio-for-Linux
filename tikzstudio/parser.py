@@ -8,10 +8,12 @@ kept as a RawElement so no user code is ever lost.
 import re
 from typing import List, Optional, Tuple
 
-from .elements import (Style, Element, LineEl, RectEl, CircleEl, EllipseEl,
+from .mathex import try_eval
+from .foreach import expand_foreach, expand_dots, split_top, brace_group
+from .elements import (fnum, Style, Element, LineEl, RectEl, CircleEl, EllipseEl,
                        PolyEl, BezierEl, PlotEl, ArcEl, GridEl, NodeEl,
                        ImageEl, RawEl, LibraryEl, GroupEl, CurveEl, PgfEl,
-                       AxisEl, Figure, TikzDocument)
+                       AxisEl, ForeachEl, PlotFnEl, Figure, TikzDocument)
 
 NUM = r"[-+]?\d*\.?\d+"
 PT = rf"\(\s*({NUM})\s*,\s*({NUM})\s*\)"
@@ -31,7 +33,21 @@ def split_statements(body: str) -> List[str]:
     stmts, cur, depth = [], "", 0
     i, n = 0, len(body)
     while i < n:
-        if body.startswith("\\pgf", i) and not cur.strip():
+        if body[i] == "%" and (i == 0 or body[i - 1] != "\\"):
+            j = body.find("\n", i)
+            j = n if j == -1 else j
+            comment = body[i:j]
+            if not cur.strip():
+                if comment.strip().lower().startswith("% lib:") and stmts:
+                    stmts[-1] += " " + comment.strip()   # legacy marker
+                else:
+                    stmts.append(comment)                # comment-only line
+            # mid-statement comments are dropped from the parse
+            i = j
+            continue
+        if body.startswith("\\pgf", i) and not cur.strip() \
+                and not body.startswith("\\pgfplotsforeachungrouped", i) \
+                and not body.startswith("\\pgfplotsinvokeforeach", i):
             j = body.find("\n", i)
             e = body.find(";", i)
             if e != -1 and (j == -1 or e < j):
@@ -39,6 +55,44 @@ def split_statements(body: str) -> List[str]:
             elif j == -1:
                 j = n
             stmts.append(body[i:j].rstrip(";").strip())
+            i = j
+            continue
+        _LOOPSTARTS = ("\\foreach", "\\pgfplotsforeachungrouped",
+                       "\\pgfplotsinvokeforeach", "\\tikzmath",
+                       "\\ifthenelse")
+        if not cur.strip() and any(body.startswith(k, i)
+                                   for k in _LOOPSTARTS):
+            depth_b, j, seen = 0, i, 0
+            while j < n:
+                if body[j] == "{":
+                    depth_b += 1
+                elif body[j] == "}":
+                    depth_b -= 1
+                    if depth_b == 0:
+                        seen += 1
+                        # done when no further top-level brace group follows
+                        k = j + 1
+                        while k < n and body[k] in " \t\n;":
+                            if body[k] == ";":
+                                k += 1
+                                break
+                            k += 1
+                        if k >= n or body[k] != "{":
+                            j = k
+                            break
+                j += 1
+            stmts.append(body[i:j].strip().rstrip(";").strip())
+            i = j
+            continue
+        if not cur.strip() and (body.startswith("\\loop", i)
+                                or body.startswith("\\newcount", i)):
+            j = body.find("\\repeat", i)
+            if body.startswith("\\loop", i) and j != -1:
+                j += len("\\repeat")
+            else:
+                j = body.find("\n", i)
+                j = n if j == -1 else j
+            stmts.append(body[i:j].strip())
             i = j
             continue
         if body.startswith("\\begin{scope}", i) and not cur.strip():
@@ -263,6 +317,101 @@ def parse_statement(stmt: str) -> Element:
 LIB_MARK = re.compile(r"^(.*?)\s*%\s*lib:(.+?)\s*$", re.S)
 
 
+_COORD_MATH = re.compile(
+    r"\(\s*(\{[^{}]*\}|" + NUM + r")\s*,\s*"
+    r"(\{[^{}]*\}|" + NUM + r")\s*\)")
+
+
+def eval_coord_math(s: str) -> str:
+    """Replace {math} components inside coordinates with their value:
+    (2, {2^2}) -> (2,4). Enables pgfmath ternaries / ifthenelse / logic
+    directly in coordinates."""
+    def rep(m):
+        a, b = m.group(1), m.group(2)
+        if not (a.startswith("{") or b.startswith("{")):
+            return m.group(0)
+        va = try_eval(a) if a.startswith("{") else float(a)
+        vb = try_eval(b) if b.startswith("{") else float(b)
+        if va is None or vb is None:
+            return m.group(0)
+        return f"({fnum(va)},{fnum(vb)})"
+    return _COORD_MATH.sub(rep, s)
+
+
+# Polar coordinates:  (angle:radius) → (x,y)
+# Angle and radius may be pgfmath expressions.  Distinguished from
+# comma-separated Cartesian coordinates by the ":" separator.
+_POLAR = re.compile(
+    r"\(\s*([-+.\d*/\s()]+?)\s*:\s*([-+.\d*/\s()]+?)\s*\)")
+
+
+def polar_to_cartesian(s: str) -> str:
+    """Convert every (angle:radius) polar coordinate in `s` to (x,y).
+    Angles are in DEGREES (pgf convention).  Non-numeric / mixed
+    payloads are left untouched."""
+    import math
+
+    def rep(m):
+        a = try_eval(m.group(1))
+        r = try_eval(m.group(2))
+        if a is None or r is None:
+            return m.group(0)
+        x = r * math.cos(math.radians(a))
+        y = r * math.sin(math.radians(a))
+        return f"({fnum(x)},{fnum(y)})"
+    return _POLAR.sub(rep, s)
+
+
+def expand_inline_foreach(stmt: str) -> str:
+    """Expand any `\\foreach ... {body}` embedded WITHIN a path (rather
+    than as a standalone statement).  Each iteration's body is joined
+    inline so path continuity survives.
+
+    Example
+    -------
+    \\draw (90:0.5) \\foreach \\i in {1,...,5} { -- (\\i*72:0.5) } -- cycle;
+    becomes:
+    \\draw (90:0.5) -- (72:0.5) -- (144:0.5) -- (216:0.5) ... -- cycle;
+    """
+    while True:
+        m = re.search(
+            r"\\foreach\s+(?P<vars>(?:\\[A-Za-z]+\s*/?\s*)+)"
+            r"(?:\[(?P<opts>[^\]]*)\])?\s+in\s+\{", stmt)
+        if not m:
+            break
+        list_start = stmt.index("{", m.end() - 1)
+        lst, list_end = brace_group(stmt, list_start)
+        if lst is None:
+            break
+        # skip whitespace until the body brace group
+        k = list_end
+        while k < len(stmt) and stmt[k] in " \t\n":
+            k += 1
+        if k >= len(stmt) or stmt[k] != "{":
+            break                       # not a well-formed foreach body
+        body, body_end = brace_group(stmt, k)
+        if body is None:
+            break
+        varnames = [v.strip() for v in m.group("vars").split("/")
+                    if v.strip()]
+        items = expand_dots(split_top(lst))
+        parts = []
+        for it in items:
+            vals = [v.strip() for v in split_top(it, "/")]
+            sub = {}
+            for i, var in enumerate(varnames):
+                sub[var] = vals[i] if i < len(vals) else (
+                    vals[-1] if vals else "")
+            b = body
+            for var in sorted(sub, key=len, reverse=True):
+                b = re.sub(re.escape(var) + r"(?![A-Za-z])",
+                           sub[var], b)
+            parts.append(b.strip())
+        expanded = " " + " ".join(parts) + " "
+        stmt = stmt[:m.start()] + expanded + stmt[body_end:]
+    return stmt
+
+
 def _parse_statement(stmt: str) -> Optional[Element]:
     s = stmt.strip()
     if s.startswith("%"):
@@ -284,6 +433,37 @@ def _parse_statement(stmt: str) -> Optional[Element]:
                                  scale=xys[3])
         return RawEl(code=s)      # marker but unmatched -> keep verbatim
 
+    if s.startswith("%"):
+        return RawEl(code=s)          # comments compile but never render
+    if any(s.startswith(k) for k in
+           ("\\foreach", "\\pgfplotsforeachungrouped",
+            "\\pgfplotsinvokeforeach")):
+        expanded = expand_foreach(s)
+        if expanded:
+            try:
+                children = [c for c in parse_body(expanded)
+                            if not isinstance(c, RawEl)]
+            except Exception:
+                children = []
+            if children:
+                return ForeachEl(children=children, code=s)
+        return RawEl(code=s)
+    if any(s.startswith(k) for k in
+           ("\\tikzmath", "\\ifthenelse", "\\loop", "\\newcount")):
+        return RawEl(code=s)          # compiles; not previewed
+    # strip a trailing plain comment (lib markers were consumed earlier)
+    s = re.sub(r"(?<!\\)%(?! *lib:).*$", "", s).strip()
+    if not s:
+        return None
+    # inline path expansions: \foreach inside a path, then polar coords.
+    # Order matters: expand loops first so their bodies get polar/math
+    # normalisation applied to the substituted values.
+    if "\\foreach" in s and s.startswith("\\draw"):
+        s = expand_inline_foreach(s)
+    if ":" in s and "(" in s:
+        s = polar_to_cartesian(s)
+    if "{" in s and "(" in s:
+        s = eval_coord_math(s)
     if s.startswith("\\sbox{\\tzsplot}"):
         m = re.fullmatch(
             r"\\sbox\{\\tzsplot\}\{(?P<code>.*)\}\s*"
@@ -384,15 +564,70 @@ def _parse_statement(stmt: str) -> Optional[Element]:
         if pts:
             return PlotEl(style=style, points=[(float(a), float(b)) for a, b in pts])
 
+    # function plot: plot[domain=a:b, samples=n] (\x, {expr}) -------------------
+    m = re.fullmatch(
+        rf"plot\s*\[(?P<popts>[^\]]*domain[^\]]*)\]\s*"
+        r"\(\s*(?P<fx>[^,()]+)\s*,\s*\{(?P<fy>[^{}]*)\}\s*\)", rest, re.S)
+    if m:
+        dom_a = dom_b = None
+        samples = 25
+        extra = []
+        for it in split_top_commas(m.group("popts")):
+            it = it.strip()
+            md = re.fullmatch(rf"domain\s*=\s*({NUM})\s*:\s*({NUM})", it)
+            if md:
+                dom_a, dom_b = float(md.group(1)), float(md.group(2))
+                continue
+            ms2 = re.fullmatch(r"samples\s*=\s*(\d+)", it)
+            if ms2:
+                samples = int(ms2.group(1))
+                continue
+            if it:
+                extra.append(it)
+        if dom_a is not None:
+            pts = []
+            n_s = max(samples, 2)
+            for k in range(n_s):
+                xv = dom_a + (dom_b - dom_a) * k / (n_s - 1)
+                sx = fnum(xv)
+                fxv = try_eval(m.group("fx").replace("\\x", sx))
+                fyv = try_eval(m.group("fy").replace("\\x", sx))
+                if fxv is None or fyv is None:
+                    pts = []
+                    break
+                pts.append((round(fxv, 4), round(fyv, 4)))
+            if pts:
+                return PlotFnEl(style=style, dom_a=dom_a, dom_b=dom_b,
+                                samples=samples, fx=m.group("fx").strip(),
+                                fy=m.group("fy").strip(),
+                                opts_extra=", ".join(extra), pts=pts)
+
+    # trailing path nodes:  ... -- (x,y) node[right] {$x_1$} ... ----------------
+    pnodes = []
+    mn = re.fullmatch(
+        r"(?P<core>.+?)(?P<nds>(?:\s*node\s*(?:\[[^\]]*\])?"
+        r"\s*\{[^{}]*\})+)", rest, re.S)
+    if mn:
+        for opts, text in re.findall(
+                r"node\s*(?:\[([^\]]*)\])?\s*\{([^{}]*)\}",
+                mn.group("nds")):
+            pnodes.append([opts.strip(), text.strip()])
+        rest_core = mn.group("core").strip()
+    else:
+        rest_core = rest
+    if pnodes:
+        rest = rest_core
+
     # polyline / polygon / simple line -----------------------------------------
     if re.fullmatch(rf"{PT}(\s*--\s*{PT})+(\s*--\s*cycle)?", rest):
         closed = rest.rstrip().endswith("cycle")
         pts = [(float(a), float(b)) for a, b in re.findall(PT, rest)]
         if len(pts) == 2 and not closed:
-            l = LineEl(style=style)
+            l = LineEl(style=style, pnodes=pnodes)
             (l.x1, l.y1), (l.x2, l.y2) = pts
             return l
-        return PolyEl(style=style, points=pts, closed=closed)
+        return PolyEl(style=style, points=pts, closed=closed,
+                      pnodes=pnodes)
 
     return None
 

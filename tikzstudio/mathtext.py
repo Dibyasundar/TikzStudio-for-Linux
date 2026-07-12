@@ -7,6 +7,40 @@ fractions).  The compiled PDF preview remains the exact rendering.
 
 import re
 
+# AMS accents: rendered with Unicode combining marks
+ACCENTS = {
+    "hat": "\u0302", "widehat": "\u0302",
+    "bar": "\u0304", "overline": "\u0305",
+    "vec": "\u20d7", "overrightarrow": "\u20d7",
+    "dot": "\u0307", "ddot": "\u0308", "dddot": "\u20db",
+    "tilde": "\u0303", "widetilde": "\u0303",
+    "check": "\u030c", "breve": "\u0306",
+    "acute": "\u0301", "grave": "\u0300",
+    "mathring": "\u030a", "underline": "\u0332",
+}
+
+
+def _apply_accents(s: str) -> str:
+    def rep(m):
+        inner = m.group(2)
+        mark = ACCENTS[m.group(1)]
+        if not inner:
+            return ""
+        # combining mark goes after EVERY base char for wide accents,
+        # after the last char otherwise (good enough for canvas text)
+        if m.group(1) in ("overline", "underline", "widehat",
+                          "widetilde", "overrightarrow"):
+            return "".join(ch + mark for ch in inner)
+        return inner[:-1] + inner[-1] + mark
+    pat = r"\\(" + "|".join(ACCENTS) + r")\{([^{}]*)\}"
+    prev = None
+    while prev != s:
+        prev = s
+        s = re.sub(pat, rep, s)
+    return s
+
+
+
 GREEK = {
     "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε",
     "varepsilon": "ε", "zeta": "ζ", "eta": "η", "theta": "θ",
@@ -63,6 +97,9 @@ def _script(chars: str, table: dict, mark: str) -> str:
 
 
 def latex_to_unicode(text: str) -> str:
+    text = _apply_accents(text)
+    for _k, _v in _BRACED_SYMBOLS.items():
+        text = text.replace("\\" + _k, _v)
     """Convert LaTeX-ish node text into displayable Unicode."""
     s = text
 
@@ -101,3 +138,59 @@ def latex_to_unicode(text: str) -> str:
     s = s.replace("$", "")
     s = re.sub(r"[{}]", "", s)
     return s
+
+
+# --- AMS / extra symbols (additive) -----------------------------------
+_EXTRA_SYMBOLS = {
+    "implies": "⟹", "impliedby": "⟸", "iff": "⟺", "mapsto": "↦",
+    "longmapsto": "⟼", "longrightarrow": "⟶", "longleftarrow": "⟵",
+    "hookrightarrow": "↪", "hookleftarrow": "↩", "rightharpoonup": "⇀",
+    "leftharpoonup": "↼", "rightleftharpoons": "⇌", "nearrow": "↗",
+    "searrow": "↘", "nwarrow": "↖", "swarrow": "↙", "uparrow": "↑",
+    "downarrow": "↓", "updownarrow": "↕", "Uparrow": "⇑",
+    "Downarrow": "⇓", "curvearrowright": "↷", "curvearrowleft": "↶",
+    "approx": "≈", "equiv": "≡", "sim": "∼", "simeq": "≃",
+    "cong": "≅", "propto": "∝", "perp": "⊥", "parallel": "∥",
+    "mid": "∣", "nmid": "∤", "ll": "≪", "gg": "≫", "asymp": "≍",
+    "doteq": "≐", "triangleq": "≜", "prec": "≺", "succ": "≻",
+    "preceq": "⪯", "succeq": "⪰", "vdash": "⊢", "dashv": "⊣",
+    "models": "⊨", "top": "⊤", "bot": "⊥",
+    "cup": "∪", "cap": "∩", "setminus": "∖", "in": "∈",
+    "notin": "∉", "ni": "∋", "subset": "⊂", "supset": "⊃",
+    "subseteq": "⊆", "supseteq": "⊇", "subsetneq": "⊊",
+    "supsetneq": "⊋", "sqsubseteq": "⊑", "sqsupseteq": "⊒",
+    "emptyset": "∅", "varnothing": "∅",
+    "oplus": "⊕", "ominus": "⊖", "otimes": "⊗", "oslash": "⊘",
+    "odot": "⊙", "boxplus": "⊞", "boxtimes": "⊠",
+    "pm": "±", "mp": "∓", "cdot": "⋅", "bullet": "•", "star": "⋆",
+    "circ": "∘", "ast": "∗", "dagger": "†", "ddagger": "‡",
+    "wedge": "∧", "vee": "∨", "neg": "¬", "lnot": "¬",
+    "forall": "∀", "exists": "∃", "nexists": "∄",
+    "aleph": "ℵ", "beth": "ℶ", "hbar": "ℏ", "ell": "ℓ",
+    "Re": "ℜ", "Im": "ℑ", "wp": "℘", "nabla": "∇", "partial": "∂",
+    "angle": "∠", "measuredangle": "∡", "sphericalangle": "∢",
+    "triangle": "△", "square": "□", "blacksquare": "■",
+    "Diamond": "◇", "lozenge": "◊",
+    "langle": "⟨", "rangle": "⟩", "lceil": "⌈", "rceil": "⌉",
+    "lfloor": "⌊", "rfloor": "⌋", "|": "‖", "Vert": "‖",
+    "prime": "′", "backslash": "\\\\",
+    "ldots": "…", "cdots": "⋯", "vdots": "⋮", "ddots": "⋱",
+    "therefore": "∴", "because": "∵", "qed": "∎",
+    "bigcup": "⋃", "bigcap": "⋂", "bigoplus": "⨁", "bigotimes": "⨂",
+    "coprod": "∐", "bigvee": "⋁", "bigwedge": "⋀",
+    "mathbb{R}": "ℝ", "mathbb{N}": "ℕ", "mathbb{Z}": "ℤ",
+    "mathbb{Q}": "ℚ", "mathbb{C}": "ℂ", "mathbb{P}": "ℙ",
+    "mathbb{E}": "𝔼", "mathbb{F}": "𝔽", "mathbb{H}": "ℍ",
+    "mathcal{L}": "ℒ", "mathcal{F}": "ℱ", "mathcal{H}": "ℋ",
+    "mathcal{O}": "𝒪", "mathcal{N}": "𝒩", "mathcal{P}": "𝒫",
+    "mathcal{B}": "ℬ", "mathcal{E}": "ℰ", "mathcal{M}": "ℳ",
+    "mathfrak{g}": "𝔤", "imath": "ı", "jmath": "ȷ",
+    "checkmark": "✓", "S": "§", "P": "¶", "copyright": "©",
+    "degree": "°", "textdegree": "°", "textmu": "µ",
+}
+try:
+    SYMBOLS.update(_EXTRA_SYMBOLS)
+except NameError:
+    pass
+
+_BRACED_SYMBOLS = {k: v for k, v in _EXTRA_SYMBOLS.items() if "{" in k}

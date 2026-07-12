@@ -5,7 +5,7 @@ import os
 import re as _re
 from typing import List, Optional, Tuple
 
-from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal, QThread
+from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal, QThread, QTimer
 from PyQt6.QtGui import (QPainter, QPen, QBrush, QColor, QPainterPath,
                          QPixmap, QFont, QTransform, QFontMetricsF)
 from PyQt6.QtWidgets import (QGraphicsView, QGraphicsScene, QGraphicsItem,
@@ -18,7 +18,7 @@ import dataclasses
 from .elements import (SCALE, Style, Element, LineEl, RectEl, CircleEl,
                        EllipseEl, PolyEl, BezierEl, PlotEl, ArcEl, GridEl,
                        NodeEl, ImageEl, RawEl, LibraryEl, GroupEl, CurveEl,
-                       PgfEl, AxisEl, Figure, catmull_to_curve)
+                       PgfEl, AxisEl, ForeachEl, PlotFnEl, Figure, catmull_to_curve)
 
 TOOLS = ["select", "line", "arrow", "rect", "circle", "ellipse", "polygon",
          "bezier", "freehand", "arc", "grid", "node", "image"]
@@ -407,6 +407,10 @@ def arrow_heads(e: Element) -> List[Tuple[QPainterPath, bool]]:
     elif isinstance(e, BezierEl):
         add(end_k, (e.x2, e.y2), (e.x2 - e.c2x, e.y2 - e.c2y))
         add(start_k, (e.x1, e.y1), (e.x1 - e.c1x, e.y1 - e.c1y))
+    elif isinstance(e, PlotFnEl) and e.pts:
+        path.moveTo(to_scene(*e.pts[0]))
+        for pnt in e.pts[1:]:
+            path.lineTo(to_scene(*pnt))
     elif isinstance(e, CurveEl) and e.segs:
         last = e.segs[-1]
         add(end_k, (last[4], last[5]), (last[4] - last[2], last[5] - last[3]))
@@ -473,6 +477,10 @@ def element_path(e: Element, canvas: "Canvas") -> QPainterPath:
         path.moveTo(to_scene(e.x1, e.y1))
         path.cubicTo(to_scene(e.c1x, e.c1y), to_scene(e.c2x, e.c2y),
                      to_scene(e.x2, e.y2))
+    elif isinstance(e, PlotFnEl) and e.pts:
+        path.moveTo(to_scene(*e.pts[0]))
+        for pnt in e.pts[1:]:
+            path.lineTo(to_scene(*pnt))
     elif isinstance(e, CurveEl) and e.segs:
         path.moveTo(to_scene(e.x0, e.y0))
         for c1x, c1y, c2x, c2y, px, py in e.segs:
@@ -552,6 +560,15 @@ def node_box(e: NodeEl):
         pad = e.inner_sep * SCALE
         w += 2 * pad
         h += 2 * pad
+    # aspect=N on cloud / callout / ellipse-callout stretches the box
+    # horizontally so w:h ≈ aspect:1 (pgf semantics).  We honour it in
+    # the model box, not just the painter, so bounding-rect / hit-test /
+    # rotate all use the correct footprint.
+    if e.aspect and e.aspect > 0 and e.shape in (
+            "cloud", "cloud callout", "ellipse callout",
+            "rectangle callout"):
+        if w < h * e.aspect:
+            w = h * e.aspect
     rect = QRectF(dx - w / 2, dy - h / 2, w, h)
     return disp, font, rect, flags, fmt.color
 
@@ -794,6 +811,8 @@ class ElementItem(QGraphicsPathItem):
     # ------------------------------------------------------------------
     def boundingRect(self) -> QRectF:
         e = self.element
+        if getattr(e, "pnodes", None):
+            return super().boundingRect().adjusted(-60, -25, 60, 25)
         if isinstance(e, NodeEl):
             _, _, rect, _, _ = node_box(e)
             if e.shape == "circle":
@@ -829,6 +848,43 @@ class ElementItem(QGraphicsPathItem):
         return super().itemChange(change, value)
 
     # ------------------------------------------------------------------
+    def _paint_path_node(self, painter, e, opts, text):
+        """Draw a trailing `node[dir] {text}` near its path position."""
+        # position: end point by default, midpoint for midway/pos=0.5
+        pth = self.path()
+        if pth.isEmpty():
+            return
+        u = 1.0
+        low = opts.lower()
+        if "midway" in low:
+            u = 0.5
+        m = _re.search(r"pos\s*=\s*([\d.]+)", low)
+        if m:
+            u = max(0.0, min(1.0, float(m.group(1))))
+        pos = pth.pointAtPercent(u)
+        disp = latex_to_unicode(text)
+        font = QFont("DejaVu Sans", 9)
+        font.setItalic("$" in text)
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+        w = fm.horizontalAdvance(disp) + 4
+        h = fm.height() + 2
+        dx = dy = 0.0
+        anchor = ""
+        for key, (kx, ky, anc) in PN_DIRS.items():
+            if _re.search(rf"(^|,)\s*{key}\s*(,|$)", low):
+                dx, dy, anchor = kx, ky, anc
+        gap = 4
+        cx = pos.x() + dx * (w / 2 + gap)
+        cy = pos.y() - dy * (h / 2 + gap)
+        rect = QRectF(cx - w / 2, cy - h / 2, w, h)
+        col = "black"
+        mcol = _re.search(r"text\s*=\s*([^,\]]+)", opts)
+        if mcol:
+            col = mcol.group(1).strip()
+        painter.setPen(QPen(qcolor(col)))
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, disp)
+
     def paint(self, painter: QPainter, option, widget=None):
         e = self.element
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -910,6 +966,8 @@ class ElementItem(QGraphicsPathItem):
             super().paint(painter, option, widget)
             if getattr(self, "_inner_pen", None) is not None:
                 painter.strokePath(self.path(), self._inner_pen)
+            for opts, text in getattr(e, "pnodes", []):
+                self._paint_path_node(painter, e, opts, text)
             # distinct arrowheads per tip style
             col = qcolor(e.style.draw or "black")
             for hp, filled in self._heads:
@@ -1121,25 +1179,25 @@ class ElementItem(QGraphicsPathItem):
             path.lineTo(r.left() - w * 0.15, r.bottom() + h * 0.2)
         elif e.shape in ("ellipse callout", "rectangle callout",
                          "cloud callout"):
-            # bubble
+            # bubble (aspect widening is already baked into r via node_box)
             bubble = QPainterPath()
             if e.shape == "rectangle callout":
                 bubble.addRect(r)
             elif e.shape == "cloud callout":
                 k = 5
-                asp = e.aspect or 1.0
-                ry = h * 0.32
-                rx = min(ry * asp, w * 0.45)
+                # bump radii scale with the (possibly widened) box
+                ry = h * 0.28
+                rx = w * 0.22
                 for i in range(k):
                     a = i * 2 * math.pi / k
                     bubble.addEllipse(
                         QPointF(cx + w * 0.32 * math.cos(a),
-                                cy + h * 0.28 * math.sin(a)),
+                                cy + h * 0.32 * math.sin(a)),
                         rx, ry)
                 bubble = bubble.simplified()
             else:
-                bubble.addEllipse(r.adjusted(-w * 0.12, -h * 0.12,
-                                             w * 0.12, h * 0.12))
+                bubble.addEllipse(r.adjusted(-w * 0.06, -h * 0.06,
+                                             w * 0.06, h * 0.06))
             # pointer wedge towards the target
             if e.has_ptr:
                 if e.ptr_rel:
@@ -1161,14 +1219,14 @@ class ElementItem(QGraphicsPathItem):
             painter.drawPath(bubble)
             return
         elif e.shape == "cloud":
+            # aspect widening is already applied in node_box
             k = 5
-            asp = e.aspect or 1.0
-            ry = h * 0.32
-            rx = min(ry * asp, w * 0.48)
+            ry = h * 0.28
+            rx = w * 0.22
             for i in range(k):
                 a = i * 2 * math.pi / k
                 bx = cx + w * 0.32 * math.cos(a)
-                by = cy + h * 0.28 * math.sin(a)
+                by = cy + h * 0.32 * math.sin(a)
                 path.addEllipse(QPointF(bx, by), rx, ry)
             path = path.simplified()
         else:
@@ -1312,66 +1370,107 @@ class LibraryItem(ElementItem):
 
 
 class PlotRenderer(QThread):
-    done = pyqtSignal(str)          # emits the cache key
+    """Background compile of a single \\sbox{\\tzsplot}{...} snippet.
 
-    def __init__(self, key, code, preamble_pkgs):
-        super().__init__()
-        self.key, self.code, self.pkgs = key, code, preamble_pkgs
+    Emits `done(key, ok)` after finishing (ok=True if a PNG landed in the
+    cache).  The renderer is fire-and-forget: it never touches the
+    canvas directly, and its subprocess run is fully isolated so a
+    malformed snippet cannot hang the app."""
+
+    done = pyqtSignal(str, bool)
+
+    def __init__(self, key, code, preamble_pkgs, parent=None):
+        super().__init__(parent)
+        self.key = key
+        self.code = code
+        self.pkgs = list(preamble_pkgs)     # snapshot, thread-safe
 
     def run(self):
         import subprocess, tempfile, shutil as sh
         from .library import LIB_DIR
+        ok = False
+        code = (self.code or "").strip()
+        if not code or "\\begin{tikzpicture}" not in code:
+            # nothing meaningful to compile — bail without touching disk
+            self.done.emit(self.key, False)
+            return
         out_dir = os.path.join(LIB_DIR, "plots")
-        os.makedirs(out_dir, exist_ok=True)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError:
+            self.done.emit(self.key, False)
+            return
         wd = tempfile.mkdtemp(prefix="tzsplot_")
         doc = ("\\documentclass[border=1pt]{standalone}\n"
                "\\usepackage{pgfplots}\n"
                "\\pgfplotsset{compat=1.18}\n"
                + "".join(f"\\usepackage{{{p}}}\n" for p in self.pkgs
                          if p not in ("pgfplots", "tikz"))
-               + "\\begin{document}\n" + self.code
+               + "\\begin{document}\n" + code
                + "\n\\end{document}\n")
         try:
-            with open(os.path.join(wd, "p.tex"), "w") as f:
+            with open(os.path.join(wd, "p.tex"),
+                      "w", encoding="utf-8") as f:
                 f.write(doc)
             r = subprocess.run(
-                ["pdflatex", "-interaction=nonstopmode", "p.tex"],
-                cwd=wd, capture_output=True, text=True, timeout=60)
-            if r.returncode == 0:
+                ["pdflatex", "-interaction=nonstopmode",
+                 "-halt-on-error", "-no-shell-escape", "p.tex"],
+                cwd=wd, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=45)
+            pdf = os.path.join(wd, "p.pdf")
+            if r.returncode == 0 and os.path.exists(pdf):
                 subprocess.run(
                     ["pdftocairo", "-png", "-transp", "-singlefile",
                      "-r", "102", "p.pdf", "plot"],
-                    cwd=wd, capture_output=True, timeout=30)
+                    cwd=wd, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=25)
                 png = os.path.join(wd, "plot.png")
-                if os.path.exists(png):
-                    sh.copy(png, os.path.join(out_dir, self.key + ".png"))
-        except Exception:
-            pass
+                if os.path.exists(png) and os.path.getsize(png) > 0:
+                    target = os.path.join(out_dir, self.key + ".png")
+                    sh.move(png, target)         # atomic within same fs
+                    ok = True
+        except (subprocess.TimeoutExpired, OSError, ValueError,
+                subprocess.SubprocessError):
+            pass                                # never let the thread die
         finally:
             sh.rmtree(wd, ignore_errors=True)
-        self.done.emit(self.key)
+        self.done.emit(self.key, ok)
 
 
 class AxisItem(ElementItem):
-    """A pgfplots axis rendered by compiling its snippet (cached)."""
+    """A pgfplots (or any \\sbox{\\tzsplot}{...}) snippet, shown as a
+    compiled bitmap.  The bitmap is display-only; the original TikZ
+    code is what gets saved and what the full document compile emits."""
 
     def rebuild(self):
         import hashlib
+        self.prepareGeometryChange()
         e: AxisEl = self.element
         self.setPath(QPainterPath())
         self.setPen(QPen(Qt.PenStyle.NoPen))
         self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
-        self._key = hashlib.md5(e.code.encode()).hexdigest()[:16]
-        self._pm = self.canvas.plot_pixmap(self._key, e.code)
+        code = (getattr(e, "code", "") or "")
+        try:
+            self._key = hashlib.md5(code.encode("utf-8")).hexdigest()[:16]
+        except Exception:
+            self._key = ""
+        self._pm = None
+        if self._key and code.strip():
+            try:
+                self._pm = self.canvas.plot_pixmap(self._key, code)
+            except Exception:
+                self._pm = None
         self.setPos(0, 0)
         self.setTransform(QTransform())
-        self.prepareGeometryChange()
 
     def boundingRect(self) -> QRectF:
         e = self.element
         c = to_scene(e.x, e.y)
-        if self._pm is not None:
-            w, h = self._pm.width(), self._pm.height()
+        pm = self._pm
+        if pm is not None and not pm.isNull() and pm.width() > 0:
+            w, h = pm.width(), pm.height()
         else:
             w, h = 5 * SCALE, 3.5 * SCALE
         return QRectF(c.x() - w / 2, c.y() - h / 2, w, h)
@@ -1384,14 +1483,23 @@ class AxisItem(ElementItem):
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         r = self.boundingRect()
-        if self._pm is not None:
-            painter.drawPixmap(r.topLeft(), self._pm)
+        pm = self._pm
+        # guard: pm can be None (still compiling / failed) or a valid QPixmap
+        if pm is not None and not pm.isNull() and pm.width() > 0:
+            painter.drawPixmap(r.topLeft(), pm)
         else:
+            # dashed placeholder tells the person what state we are in.
+            # (Compilation is debounced ~700 ms after the last edit; the
+            # real document compile / export uses the sbox code as-is.)
+            cached_failure = (self._key in self.canvas._plot_pms
+                              and self.canvas._plot_pms[self._key] is None)
             painter.setPen(QPen(QColor("#6b7280"), 1, Qt.PenStyle.DashLine))
             painter.setBrush(QBrush(QColor(240, 244, 248, 180)))
             painter.drawRect(r)
-            painter.drawText(r, Qt.AlignmentFlag.AlignCenter,
-                             "pgfplots\n(compiling preview…)")
+            msg = ("pgfplots\n(compile error — F5 for full log)"
+                   if cached_failure
+                   else "pgfplots\n(compiling preview…)")
+            painter.drawText(r, Qt.AlignmentFlag.AlignCenter, msg)
         if self.isSelected():
             painter.setPen(QPen(QColor(30, 120, 255), 1,
                                 Qt.PenStyle.DashLine))
@@ -1399,7 +1507,34 @@ class AxisItem(ElementItem):
             painter.drawRect(r)
 
 
+PN_DIRS = {"right": (1, 0, "w"), "left": (-1, 0, "e"),
+           "above": (0, 1, "s"), "below": (0, -1, "n"),
+           "above right": (1, 1, "sw"), "above left": (-1, 1, "se"),
+           "below right": (1, -1, "nw"), "below left": (-1, -1, "ne")}
+
+
+class ForeachItem(GroupItem):
+    """Preview of an expanded \\foreach — rendered but not movable,
+    since its geometry lives inside the loop's code."""
+
+    def rebuild(self):
+        super().rebuild()
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        if self.isSelected():
+            painter.setPen(QPen(QColor(150, 100, 255), 1,
+                                Qt.PenStyle.DotLine))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            r = self.childrenBoundingRect().adjusted(-3, -3, 3, 3)
+            painter.drawRect(r)
+            painter.drawText(r.topLeft() + QPointF(2, -3), "\\foreach")
+
+
 def make_item(e: Element, canvas: "Canvas", pgf=None) -> ElementItem:
+    if isinstance(e, ForeachEl):
+        return ForeachItem(e, canvas, pgf)
     if isinstance(e, AxisEl):
         return AxisItem(e, canvas, pgf)
     if isinstance(e, GroupEl):
@@ -1441,8 +1576,20 @@ class Canvas(QGraphicsView):
         self.snap = True
         self.show_grid = True
         self.auto_select = True        # revert to Select after drawing
-        self._plot_pms = {}            # key -> QPixmap
-        self._plot_threads = {}        # key -> PlotRenderer
+        # Plot rendering pipeline (see plot_pixmap):
+        #   _plot_pms[key]      QPixmap on success / None on cached failure
+        #   _plot_thread        the one active PlotRenderer (or None)
+        #   _pending_compile    (key, code) queued while debouncing / busy
+        #   _compile_timer      QTimer that fires after typing settles
+        # Design: at most ONE pdflatex runs at a time; the display is
+        # driven purely from the cached PNG, so the code / export path is
+        # untouched.  Editing never spawns a thread storm.
+        self._plot_pms = {}
+        self._plot_thread = None
+        self._pending_compile = None
+        self._compile_timer = QTimer(self)
+        self._compile_timer.setSingleShot(True)
+        self._compile_timer.timeout.connect(self._start_pending_compile)
         self.grid_step = 0.5   # cm — visible grid AND snap step
         self.auto_revert = True     # back to Select after drawing (setting)
         self._last_mouse = (0.0, 0.0)   # cm, for paste-at-cursor
@@ -1497,35 +1644,109 @@ class Canvas(QGraphicsView):
         return sh.size_cm[0] * SCALE, sh.size_cm[1] * SCALE
 
     # -- tools / figure -------------------------------------------------------
+    def _load_plot_pixmap(self, path):
+        """Load a cached plot PNG, rescaling to canvas cm/px.  Returns
+        None on any load failure so we never draw an invalid pixmap."""
+        try:
+            pm = QPixmap(path)
+        except Exception:
+            return None
+        if pm.isNull() or pm.width() <= 0 or pm.height() <= 0:
+            return None
+        # rendered at 102 dpi ≈ 40.16 px/cm; rescale to canvas SCALE
+        f = SCALE / (102 / 2.54)
+        if abs(f - 1) > 0.01:
+            w = max(1, round(pm.width() * f))
+            h = max(1, round(pm.height() * f))
+            pm = pm.scaled(
+                w, h,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+        return pm
+
     def plot_pixmap(self, key, code):
-        """Cached pixmap of a compiled pgfplots snippet, or None while a
-        background render is in flight."""
+        """Called by AxisItem during rebuild.  Returns:
+             QPixmap - image ready to draw
+             None    - not ready yet (rendering / failed / empty)
+        This call is NON-BLOCKING and safe to invoke on every rebuild.
+        It never spawns a thread directly - it just queues a debounced
+        compile, so rapid typing coalesces into a single pdflatex run
+        after the code stops changing.
+        """
+        if not (code or "").strip():
+            return None
+        # in-memory cache (session hits: instant)
         if key in self._plot_pms:
             return self._plot_pms[key]
+        # on-disk cache (survives sessions)
         from .library import LIB_DIR
         png = os.path.join(LIB_DIR, "plots", key + ".png")
         if os.path.exists(png):
-            pm = QPixmap(png)
-            # rendered at 102 dpi ≈ 40.16 px/cm; rescale to canvas scale
-            f = SCALE / (102 / 2.54)
-            if abs(f - 1) > 0.01:
-                pm = pm.scaled(round(pm.width() * f),
-                               round(pm.height() * f),
-                               Qt.AspectRatioMode.KeepAspectRatio,
-                               Qt.TransformationMode.SmoothTransformation)
-            self._plot_pms[key] = pm
+            pm = self._load_plot_pixmap(png)
+            self._plot_pms[key] = pm            # remember success/failure
             return pm
-        if key not in self._plot_threads:
-            pkgs = getattr(self.figure, "_doc_packages", [])
-            th = PlotRenderer(key, code, pkgs)
-            th.done.connect(self._plot_done)
-            self._plot_threads[key] = th
-            th.start()
+        # queue a debounced compile (700ms after edits settle)
+        self._pending_compile = (key, code)
+        self._compile_timer.start(700)
         return None
 
-    def _plot_done(self, key):
-        self._plot_threads.pop(key, None)
-        self.rebuild_scene()
+    def _start_pending_compile(self):
+        """Fires when the compile timer elapses.  Starts the pending
+        compile if no thread is currently running; otherwise reschedules."""
+        target = self._pending_compile
+        if target is None:
+            return
+        # already busy?  wait for the current run to emit done, then retry
+        if self._plot_thread is not None and self._plot_thread.isRunning():
+            self._compile_timer.start(300)
+            return
+        key, code = target
+        # someone may have populated the cache while we were waiting
+        if key in self._plot_pms:
+            self._pending_compile = None
+            return
+        pkgs = getattr(self.figure, "_doc_packages", [])
+        th = PlotRenderer(key, code, pkgs, parent=self)
+        th.done.connect(self._plot_done)
+        self._plot_thread = th
+        self._pending_compile = None
+        th.start()
+
+    def _plot_done(self, key, ok):
+        """Slot invoked (on the main thread via queued connection) when
+        the current PlotRenderer finishes.  Caches the result and asks
+        the scene to refresh — NEVER during another rebuild."""
+        from .library import LIB_DIR
+        png = os.path.join(LIB_DIR, "plots", key + ".png")
+        if ok and os.path.exists(png):
+            self._plot_pms[key] = self._load_plot_pixmap(png)
+        else:
+            self._plot_pms[key] = None          # remember failure; no retry
+        # let the thread finalize before we drop the reference
+        if self._plot_thread is not None:
+            self._plot_thread.deleteLater()
+            self._plot_thread = None
+        # if the user typed more in the meantime, chain the next compile
+        if self._pending_compile is not None:
+            self._compile_timer.start(50)
+            return
+        # schedule the visual refresh: NEVER call rebuild_scene inline
+        # from a signal, or we can re-enter through AxisItem.rebuild ->
+        # plot_pixmap. QTimer.singleShot bounces it to the main loop.
+        QTimer.singleShot(0, self.rebuild_scene)
+
+    def stop_plot_worker(self):
+        """Called on close: cancel any pending compile and wait briefly
+        for an in-flight thread so pdflatex isn't orphaned."""
+        self._compile_timer.stop()
+        self._pending_compile = None
+        if self._plot_thread is not None:
+            try:
+                self._plot_thread.done.disconnect(self._plot_done)
+            except (TypeError, RuntimeError):
+                pass
+            self._plot_thread.wait(2000)        # up to 2s
+            self._plot_thread = None
 
     def set_partial_select(self, partial: bool):
         self.setRubberBandSelectionMode(

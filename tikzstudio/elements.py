@@ -115,13 +115,24 @@ class Element:
         return False
 
 
+def _pn_tikz(nodes):
+    """Emit trailing path-node clauses:  node[opts] {text} ..."""
+    out = ""
+    for opts, text in nodes:
+        o = f"[{opts}]" if opts else ""
+        out += f" node{o} {{{text}}}"
+    return out
+
+
 @dataclass
 class LineEl(Element):
     x1: float = 0; y1: float = 0; x2: float = 1; y2: float = 0
+    pnodes: List[List[str]] = field(default_factory=list)  # [opts, text]
 
     def to_tikz(self):
         return (f"\\draw{self.style.options()} ({fnum(self.x1)},{fnum(self.y1)})"
-                f" -- ({fnum(self.x2)},{fnum(self.y2)});")
+                f" -- ({fnum(self.x2)},{fnum(self.y2)})"
+                f"{_pn_tikz(self.pnodes)};")
 
     def translate(self, dx, dy):
         self.x1 += dx; self.y1 += dy; self.x2 += dx; self.y2 += dy
@@ -232,11 +243,13 @@ class PolyEl(Element):
     """Closed or open poly-line.  Also used for stars and callouts."""
     points: List[Tuple[float, float]] = field(default_factory=list)
     closed: bool = True
+    pnodes: List[List[str]] = field(default_factory=list)  # [opts, text]
 
     def to_tikz(self):
         pts = " -- ".join(f"({fnum(x)},{fnum(y)})" for x, y in self.points)
-        tail = " -- cycle;" if self.closed else ";"
-        return f"\\draw{self.style.options()} {pts}{tail}"
+        tail = " -- cycle" if self.closed else ""
+        return (f"\\draw{self.style.options()} {pts}{tail}"
+                f"{_pn_tikz(self.pnodes)};")
 
     def translate(self, dx, dy):
         self.points = [(x + dx, y + dy) for x, y in self.points]
@@ -581,6 +594,34 @@ def catmull_to_curve(pts, style=None):
 
 
 @dataclass
+class PlotFnEl(Element):
+    """\\draw plot[domain=a:b, samples=n] (fx, {expr}); — the function
+    plot is preserved verbatim and sampled for the canvas preview."""
+    dom_a: float = 0.0
+    dom_b: float = 1.0
+    samples: int = 25
+    fx: str = "\\x"
+    fy: str = "\\x"
+    opts_extra: str = ""         # other plot[...] options, verbatim
+    pts: List[Tuple[float, float]] = field(default_factory=list)
+
+    def to_tikz(self):
+        opts = f"domain={fnum(self.dom_a)}:{fnum(self.dom_b)}"
+        if self.samples != 25:
+            opts += f", samples={self.samples}"
+        if self.opts_extra:
+            opts += f", {self.opts_extra}"
+        return (f"\\draw{self.style.options()} plot[{opts}] "
+                f"({self.fx}, {{{self.fy}}});")
+
+    def translate(self, dx, dy):
+        pass                     # function of \\x: not translatable
+
+    def bake(self, s, dx, dy):
+        return False
+
+
+@dataclass
 class AxisEl(Element):
     """A pgfplots axis (or any picture) kept in a \\savebox and shown
     as a node — the recommended way to embed a plot without nested-
@@ -652,6 +693,24 @@ class GroupEl(Element):
         self.x = dx + s * self.x; self.y = dy + s * self.y
         self.s *= s
         return True
+
+
+
+@dataclass
+class ForeachEl(GroupEl):
+    """A \\foreach-family loop: the original statement is preserved
+    verbatim; `children` hold the expanded statements used only for the
+    canvas preview (the group is not movable)."""
+    code: str = ""
+
+    def to_tikz(self):
+        return self.code
+
+    def translate(self, dx, dy):
+        pass                     # verbatim code: position is in the loop
+
+    def bake(self, s, dx, dy):
+        return False
 
 
 @dataclass

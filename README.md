@@ -1,9 +1,14 @@
 **This project aims to develop a native Linux interface inspired by TikZedit. Please note that the majority of the codebase was generated using Claude's Fabel AI model. The software is currently under active development and is provided "as is," so please use it at your own discretion. We anticipate rolling out new version releases in the near future.**
 
+# TikZ Studio
+
+A WYSIWYG desktop editor for TikZ/LaTeX diagrams on Linux, with **live
+two-way synchronization** between a visual canvas and the TikZ source code.
+
 ## Install (Debian/Ubuntu)
 
 ```bash
-sudo apt install ./tikzstudio_1.9.0_all.deb
+sudo apt install ./tikzstudio_2.0.3_all.deb
 ```
 
 This pulls in the dependencies automatically: `python3-pyqt6`,
@@ -35,6 +40,35 @@ Launch from the application menu (**TikZ Studio**) or run `tikzstudio`.
   appears in the palette permanently (marked ★).
 
 **Visual canvas (left/center)**
+- **Loops & conditionals rendered**: `\foreach` (dots notation
+  `{1,...,10}` and `{0,2,...,10}` both directions, multi-variable
+  `\x/\y`, `[evaluate=… using …]`, `[count=…]`, `\breakforeach`),
+  `\pgfplotsinvokeforeach` (#1), `\pgfplotsforeachungrouped` — all
+  expanded for the canvas preview while the loop code stays verbatim.
+  `\ifnum`/`\ifdim`/`\ifcase … \or … \else … \fi` inside loop bodies
+  are evaluated; pgfmath ternaries (`cond ? a : b`), `ifthenelse()`
+  and logic operators work directly inside coordinates; and
+  `plot[domain=a:b, samples=n] (\x, {expr})` function plots are
+  sampled and drawn. `\tikzmath` and plain-TeX loops are preserved
+  for compilation.
+- **Inline path nodes**: `\draw[->] (0,0) -- (6,0) node[right]
+  {$x_1$};` — trailing `node[…] {…}` clauses on lines and polylines
+  parse, render at the correct position (direction keywords, `midway`,
+  `pos=`), and round-trip.
+- **Comments ignored while rendering**: comment lines are preserved in
+  the code but never create canvas artefacts; trailing comments are
+  stripped from statements before parsing.
+- **AMS math**: `\hat \bar \vec \tilde \dot \ddot \check \breve
+  \acute \grave \mathring \overline` accents (Unicode combining
+  marks) plus ~120 more symbols (⟹ ⟺ ∈ ℝ ℕ ℤ ∀ ∃ ∇ ⊕ ⪯ …) render in
+  node text.
+
+**Python plugins**
+- Plugins are Python files in `~/.local/share/tikzstudio/plugins/`.
+  *Plugins ▸ New plugin…* creates one and shows the template (with the
+  full API documented in its docstring); **Ctrl+P** opens a searchable
+  popup to run any plugin. Plugins get the app object and can read or
+  modify the figure, parse TikZ code, and refresh the canvas.
 - **Even more node shapes rendered**: arrow box, rounded rectangle
   (stadium), chamfered rectangle, cross out, circular sector,
   semicircle, forbidden sign, magnifying glass — plus `aspect=` on
@@ -286,6 +320,7 @@ tikzstudio/
   dialogs.py    package/library manager
   app.py        main window
 ```
+
 
 
 ## Screenshot of UI
