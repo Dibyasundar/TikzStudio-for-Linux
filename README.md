@@ -329,3 +329,5 @@ tikzstudio/
 ## Screenshot of Image in TikZ Studio
 <img width="1848" height="1003" alt="example" src="https://github.com/user-attachments/assets/6d0f266a-98be-4b2a-a41a-3bd008c3d76d" />
 
+## Screenshot of Plot
+<img width="1844" height="1002" alt="scatterplot" src="https://github.com/user-attachments/assets/362ca410-5b2e-4955-be8e-a25e6b278ea9" />
