@@ -36,6 +36,8 @@ from .dialogs import PreambleDialog
 
 TOOL_LABELS = {
     "select": ("⬚", "Select / move (S)"),
+    "pan": ("✋", "Pan the view (H) — drag to move; also Space+drag / "
+            "middle-mouse-drag from any tool"),
     "line": ("╱", "Line (L) — drag"),
     "arrow": ("→", "Arrow (A) — drag"),
     "rect": ("▭", "Rectangle (R) — drag"),
@@ -74,6 +76,16 @@ class MainWindow(QMainWindow):
         self.current_fig = 0
         self.file_path = None
         self.base_dir = os.getcwd()
+        # ---- auto-save --------------------------------------------------
+        # `_autosave_hash` remembers the content we last wrote to disk so
+        # a periodic tick with no changes is a no-op.
+        # `_autosave_seconds` is the tick period (0 = disabled).
+        # `_autosave_on_compile` is a boolean.
+        self._autosave_hash = None
+        self._autosave_seconds = 120        # default 2 min
+        self._autosave_on_compile = True
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.timeout.connect(self._auto_save_tick)
         self._syncing = False
         self.compiler = Compiler()
         self.compiler.finished.connect(self._compile_done)
@@ -159,7 +171,7 @@ class MainWindow(QMainWindow):
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb)
         group = QActionGroup(self); group.setExclusive(True)
         self.tool_actions = {}
-        shortcuts = {"select": "S", "line": "L", "rect": "R",
+        shortcuts = {"select": "S", "pan": "H", "line": "L", "rect": "R",
                      "circle": "C", "ellipse": "E", "polygon": "P",
                      "bezier": "B", "freehand": "F", "node": "N"}
         for tool in TOOLS:
@@ -374,6 +386,17 @@ class MainWindow(QMainWindow):
         self.auto_cb.setChecked(autoc)
         self.act_auto_select.setChecked(auto_sel)
         self.act_partial.setChecked(partial)
+        # auto-save preferences
+        # New key `autosave_seconds` is authoritative; migrate the old
+        # `autosave_interval` (in minutes) on first launch after upgrade.
+        secs = st.value("autosave_seconds", None)
+        if secs is None:
+            legacy_min = st.value("autosave_interval", 2, type=int)
+            secs = int(legacy_min) * 60
+        self._autosave_seconds = int(secs)
+        self._autosave_on_compile = st.value("autosave_on_compile",
+                                              True, type=bool)
+        self._apply_autosave_settings()
 
     def _save_settings(self):
         st = self.settings
@@ -383,7 +406,87 @@ class MainWindow(QMainWindow):
         st.setValue("grid_step", self.grid_spin.value())
         st.setValue("snap", self.canvas.snap)
         st.setValue("auto_compile", self.auto_cb.isChecked())
+        st.setValue("autosave_seconds", self._autosave_seconds)
+        st.setValue("autosave_on_compile", self._autosave_on_compile)
         st.sync()
+
+    # ------------------------------------------------------------------
+    # Auto-save
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _fmt_autosave(secs: int) -> str:
+        """Human-friendly rendering for a seconds interval (used in
+        status messages and the menu label)."""
+        if not secs:
+            return "off"
+        if secs < 60:
+            return f"{secs} second(s)"
+        if secs % 60 == 0:
+            m = secs // 60
+            return f"{m} minute(s)"
+        return f"{secs // 60} min {secs % 60} s"
+
+    def _apply_autosave_settings(self):
+        """(Re)start the periodic timer according to the current
+        interval; 0 disables it."""
+        if self._autosave_seconds and self._autosave_seconds > 0:
+            self._autosave_timer.start(self._autosave_seconds * 1000)
+        else:
+            self._autosave_timer.stop()
+
+    def _auto_save_tick(self):
+        """Periodic tick: save silently if the doc has a path AND has
+        actually changed since the last write."""
+        if not self.file_path:
+            return
+        try:
+            self._flush_pending_code()
+        except Exception:
+            pass
+        text = self.doc.full_document()
+        h = hash(text)
+        if h == self._autosave_hash:
+            return
+        try:
+            with open(self.file_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            self._autosave_hash = h
+            from datetime import datetime
+            self.statusBar().showMessage(
+                f"Auto-saved  ({datetime.now().strftime('%H:%M:%S')})",
+                3000)
+        except OSError as exc:
+            # never nag; the manual Ctrl+S remains the source of truth
+            self.statusBar().showMessage(
+                f"Auto-save failed: {exc}", 5000)
+
+    def _set_autosave_seconds(self, seconds: int):
+        self._autosave_seconds = max(0, int(seconds))
+        self._apply_autosave_settings()
+        self._save_settings()
+        pretty = self._fmt_autosave(self._autosave_seconds)
+        if self._autosave_seconds:
+            self.statusBar().showMessage(f"Auto-save every {pretty}.", 4000)
+        else:
+            self.statusBar().showMessage("Auto-save disabled.", 4000)
+
+    def _prompt_autosave_custom(self):
+        """Open a small dialog to enter an arbitrary interval in seconds."""
+        secs, ok = QInputDialog.getInt(
+            self, "Custom auto-save interval",
+            "Seconds between auto-saves\n"
+            "(minimum 5, maximum 3600; 0 = disabled):",
+            max(5, self._autosave_seconds or 30), 0, 3600, 1)
+        if ok:
+            self._set_autosave_seconds(secs)
+            self._sync_autosave_menu()
+
+    def _toggle_autosave_on_compile(self, checked: bool):
+        self._autosave_on_compile = bool(checked)
+        self._save_settings()
+        self.statusBar().showMessage(
+            "Auto-save on F5 compile " + ("ON." if checked else "OFF."),
+            4000)
 
     def closeEvent(self, ev):
         # cancel any queued/in-flight plot compile so pdflatex is not
@@ -721,6 +824,44 @@ class MainWindow(QMainWindow):
         self.act_partial.toggled.connect(self._toggle_partial)
         sm.addAction(self.act_partial)
         sm.addSeparator()
+        # -------- auto-save controls --------------------------------
+        self.act_autosave_on_compile = QAction(
+            "Auto-save on F5 compile", self)
+        self.act_autosave_on_compile.setCheckable(True)
+        self.act_autosave_on_compile.setChecked(self._autosave_on_compile)
+        self.act_autosave_on_compile.toggled.connect(
+            self._toggle_autosave_on_compile)
+        sm.addAction(self.act_autosave_on_compile)
+        as_menu = sm.addMenu("Auto-save interval")
+        self._autosave_actions = {}
+        presets = [
+            ("Off", 0),
+            ("15 seconds", 15),
+            ("30 seconds", 30),
+            ("1 minute", 60),
+            ("2 minutes", 120),
+            ("5 minutes", 300),
+            ("10 minutes", 600),
+        ]
+        for label, secs in presets:
+            a = QAction(label, self)
+            a.setCheckable(True)
+            a.setChecked(secs == self._autosave_seconds)
+            a.triggered.connect(
+                lambda _=False, s=secs: (
+                    self._set_autosave_seconds(s),
+                    self._sync_autosave_menu()))
+            as_menu.addAction(a)
+            self._autosave_actions[secs] = a
+        as_menu.addSeparator()
+        custom = QAction("Custom (seconds)…", self)
+        custom.setCheckable(True)
+        custom.setChecked(self._autosave_seconds not in
+                          [s for _, s in presets])
+        custom.triggered.connect(self._prompt_autosave_custom)
+        as_menu.addAction(custom)
+        self._autosave_custom_action = custom
+        sm.addSeparator()
         info_act = self._act(
             "Settings, custom elements and groups are stored in your home "
             "folder and survive app updates", None, lambda: None)
@@ -729,6 +870,33 @@ class MainWindow(QMainWindow):
 
         h = m.addMenu("&Help")
         h.addAction(self._act("About", None, self._about))
+
+        # ---------- View menu (canvas navigation) ----------------------
+        vm = m.addMenu("&View")
+        vm.addAction(self._act("Pan tool", "H",
+                               lambda: self.canvas.set_tool("pan")))
+        vm.addSeparator()
+        vm.addAction(self._act("Fit all elements", "Ctrl+0",
+                               lambda: self.canvas.fit_to_content()))
+        vm.addAction(self._act("Reset zoom / centre on origin",
+                               "Ctrl+Home",
+                               lambda: self.canvas.reset_view()))
+        vm.addSeparator()
+        info_v = self._act(
+            "Space+drag or middle-mouse-drag pans from any tool", None,
+            lambda: None)
+        info_v.setEnabled(False)
+        vm.addAction(info_v)
+
+    def _sync_autosave_menu(self):
+        matched = False
+        for secs, act in self._autosave_actions.items():
+            on = (secs == self._autosave_seconds)
+            act.setChecked(on)
+            matched = matched or on
+        # Custom action gets the check when no preset matches
+        if hasattr(self, "_autosave_custom_action"):
+            self._autosave_custom_action.setChecked(not matched)
 
     def _act(self, text, shortcut, slot):
         a = QAction(text, self)
@@ -2031,6 +2199,21 @@ def run(app):
                 self.doc.tikz_libraries.append(libname)
 
     def compile(self):
+        # Auto-save on F5 (only when we know where to save, and only
+        # when the content has actually changed since the last write)
+        if self._autosave_on_compile and self.file_path:
+            try:
+                self._flush_pending_code()
+                text = self.doc.full_document()
+                if hash(text) != self._autosave_hash:
+                    with open(self.file_path, "w", encoding="utf-8") as f:
+                        f.write(text)
+                    self._autosave_hash = hash(text)
+                    self.statusBar().showMessage(
+                        f"Saved {self.file_path} — compiling…", 3000)
+            except OSError as exc:
+                self.statusBar().showMessage(
+                    f"Auto-save on compile failed: {exc}", 5000)
         self._ensure_shape_libs()
         self._sync_doc_meta()
         if any(isinstance(e, ImageEl) for f in self.doc.figures
@@ -2131,8 +2314,12 @@ def run(app):
             self.file_path = path
             self._set_base_dir(os.path.dirname(os.path.abspath(path)))
             self._update_file_label()
+        text = self.doc.full_document()
         with open(self.file_path, "w", encoding="utf-8") as f:
-            f.write(self.doc.full_document())
+            f.write(text)
+        # sync auto-save hash so the periodic tick doesn't rewrite this
+        # same content a moment later
+        self._autosave_hash = hash(text)
         self.statusBar().showMessage(f"Saved {self.file_path}", 5000)
 
     def open_tex(self):
@@ -2152,6 +2339,9 @@ def run(app):
         self.current_fig = 0
         self._refresh_fig_tabs()
         self._push_code_to_editor()
+        # Seed the auto-save hash to whatever we just loaded — a periodic
+        # tick with no user edits should be a no-op, not a rewrite.
+        self._autosave_hash = hash(self.doc.full_document())
         n_raw = sum(isinstance(e, RawEl) for f in self.doc.figures
                     for e in f.elements)
         msg = (f"Imported {len(self.doc.figures)} figure(s) from "

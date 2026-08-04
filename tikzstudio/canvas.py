@@ -5,9 +5,11 @@ import os
 import re as _re
 from typing import List, Optional, Tuple
 
-from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal, QThread, QTimer
+from PyQt6.QtCore import (Qt, QPointF, QRectF, pyqtSignal, QThread,
+                          QTimer, QEvent)
 from PyQt6.QtGui import (QPainter, QPen, QBrush, QColor, QPainterPath,
-                         QPixmap, QFont, QTransform, QFontMetricsF)
+                         QPixmap, QFont, QTransform, QFontMetricsF,
+                         QMouseEvent)
 from PyQt6.QtWidgets import (QGraphicsView, QGraphicsScene, QGraphicsItem,
                              QGraphicsPathItem, QGraphicsRectItem,
                              QInputDialog, QFileDialog, QMenu)
@@ -20,8 +22,8 @@ from .elements import (SCALE, Style, Element, LineEl, RectEl, CircleEl,
                        NodeEl, ImageEl, RawEl, LibraryEl, GroupEl, CurveEl,
                        PgfEl, AxisEl, ForeachEl, PlotFnEl, Figure, catmull_to_curve)
 
-TOOLS = ["select", "line", "arrow", "rect", "circle", "ellipse", "polygon",
-         "bezier", "freehand", "arc", "grid", "node", "image"]
+TOOLS = ["select", "pan", "line", "arrow", "rect", "circle", "ellipse",
+         "polygon", "bezier", "freehand", "arc", "grid", "node", "image"]
 
 
 # ----------------------------------------------------------------------
@@ -1557,7 +1559,10 @@ class Canvas(QGraphicsView):
 
     def __init__(self):
         super().__init__()
-        self._scene = QGraphicsScene(-2000, -2000, 4000, 4000)
+        # 400×400 cm scene: plenty of headroom for scrolling / panning.
+        # (Previous 100 cm rect could feel cramped once you zoomed out.)
+        half = 200 * SCALE
+        self._scene = QGraphicsScene(-half, -half, 2 * half, 2 * half)
         self.setScene(self._scene)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         # full-viewport repaints kill the "ghost trail" artefacts left by
@@ -1820,9 +1825,13 @@ class Canvas(QGraphicsView):
         self.tool = tool
         self._poly_pts = []
         self._kill_temp()
-        self.setDragMode(QGraphicsView.DragMode.RubberBandDrag
-                         if tool == "select"
-                         else QGraphicsView.DragMode.NoDrag)
+        if tool == "pan":
+            # click-drag pans the view; scroll bars still work
+            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        elif tool == "select":
+            self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+        else:
+            self.setDragMode(QGraphicsView.DragMode.NoDrag)
         hint = ""
         if tool == "polygon":
             hint = "  (click vertices, double-click to close)"
@@ -1831,8 +1840,32 @@ class Canvas(QGraphicsView):
         elif tool == "bezier":
             hint = ("  (click any number of anchor points, double-click "
                     "to finish the smooth curve)")
+        elif tool == "pan":
+            hint = ("  (drag to move the view; Space+drag or middle-mouse "
+                    "drag pans temporarily from any tool)")
         self.status.emit(f"Tool: {tool}{hint}")
         self.tool_changed.emit(tool)
+
+    def fit_to_content(self):
+        """Zoom to fit every element in the current figure into the view
+        with a small margin."""
+        items = [i for i in self._scene.items()
+                 if isinstance(i, ElementItem)]
+        if not items:
+            self.resetTransform()
+            self.centerOn(0, 0)
+            return
+        r = items[0].sceneBoundingRect()
+        for it in items[1:]:
+            r = r.united(it.sceneBoundingRect())
+        pad = 40
+        r.adjust(-pad, -pad, pad, pad)
+        self.fitInView(r, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def reset_view(self):
+        """Restore 1 : 1 zoom centred on the origin."""
+        self.resetTransform()
+        self.centerOn(0, 0)
 
     def load_figure(self, fig: Figure):
         self.figure = fig
@@ -1950,7 +1983,21 @@ class Canvas(QGraphicsView):
         return to_scene(x, y)
 
     def mousePressEvent(self, ev):
-        if self.tool == "select" or ev.button() != Qt.MouseButton.LeftButton:
+        # Middle-mouse button: temporarily pan the view from any tool.
+        # We fake a left-button ScrollHandDrag press so QGraphicsView's
+        # own hand-drag machinery handles the pan.
+        if ev.button() == Qt.MouseButton.MiddleButton:
+            self._temp_pan_prev = self.dragMode()
+            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+            fake = QMouseEvent(
+                QEvent.Type.MouseButtonPress, ev.position(),
+                ev.globalPosition(),
+                Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                ev.modifiers())
+            super().mousePressEvent(fake)
+            return
+        if self.tool in ("select", "pan") \
+                or ev.button() != Qt.MouseButton.LeftButton:
             return super().mousePressEvent(ev)
         sp = self._snap_pt(self.mapToScene(ev.pos()))
         x, y = from_scene(sp)
@@ -1991,7 +2038,7 @@ class Canvas(QGraphicsView):
 
     def mouseMoveEvent(self, ev):
         self._last_mouse = from_scene(self.mapToScene(ev.pos()))
-        if self.tool == "select" or self._start is None:
+        if self.tool in ("select", "pan") or self._start is None:
             if self.tool in ("polygon", "multiarrow", "bezier") \
                     and self._poly_pts:
                 self._preview_poly(self.mapToScene(ev.pos()))
@@ -2006,7 +2053,19 @@ class Canvas(QGraphicsView):
         self._preview_drag(self._start, cur)
 
     def mouseReleaseEvent(self, ev):
-        if self.tool == "select":
+        # End of a middle-mouse temporary pan: restore prior drag mode.
+        if ev.button() == Qt.MouseButton.MiddleButton \
+                and hasattr(self, "_temp_pan_prev"):
+            fake = QMouseEvent(
+                QEvent.Type.MouseButtonRelease, ev.position(),
+                ev.globalPosition(),
+                Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
+                ev.modifiers())
+            super().mouseReleaseEvent(fake)
+            self.setDragMode(self._temp_pan_prev)
+            del self._temp_pan_prev
+            return
+        if self.tool in ("select", "pan"):
             return super().mouseReleaseEvent(ev)
         if self._start is None or self.tool in ("polygon", "multiarrow",
                                                  "bezier"):
@@ -2084,6 +2143,21 @@ class Canvas(QGraphicsView):
         key = ev.key()
         ctrl = ev.modifiers() & Qt.KeyboardModifier.ControlModifier
         shift = ev.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        # Space held anywhere: temporary pan overlay (like most creative
+        # apps).  On release we restore the prior drag mode.
+        if key == Qt.Key.Key_Space and not ev.isAutoRepeat() \
+                and not hasattr(self, "_space_pan_prev"):
+            self._space_pan_prev = self.dragMode()
+            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+            self.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
+            return
+        # Ctrl+0 fits every element into the view; Ctrl+Home resets.
+        if ctrl and key == Qt.Key.Key_0:
+            self.fit_to_content()
+            return
+        if ctrl and key == Qt.Key.Key_Home:
+            self.reset_view()
+            return
         if ctrl and shift and key == Qt.Key.Key_C:
             self.copy_selection()
             return
@@ -2122,6 +2196,15 @@ class Canvas(QGraphicsView):
             self.model_changed.emit()
             return
         super().keyPressEvent(ev)
+
+    def keyReleaseEvent(self, ev):
+        if ev.key() == Qt.Key.Key_Space and not ev.isAutoRepeat() \
+                and hasattr(self, "_space_pan_prev"):
+            self.setDragMode(self._space_pan_prev)
+            self.viewport().unsetCursor()
+            del self._space_pan_prev
+            return
+        super().keyReleaseEvent(ev)
 
     def contextMenuEvent(self, ev):
         item = self.itemAt(ev.pos())

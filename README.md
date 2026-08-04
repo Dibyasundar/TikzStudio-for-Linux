@@ -8,7 +8,7 @@ two-way synchronization** between a visual canvas and the TikZ source code.
 ## Install (Debian/Ubuntu)
 
 ```bash
-sudo apt install ./tikzstudio_2.0.3_all.deb
+sudo apt install ./tikzstudio_2.0.5_all.deb
 ```
 
 This pulls in the dependencies automatically: `python3-pyqt6`,
@@ -320,8 +320,6 @@ tikzstudio/
   dialogs.py    package/library manager
   app.py        main window
 ```
-
-
 
 ## Screenshot of UI
 <img width="1845" height="1020" alt="UI" src="https://github.com/user-attachments/assets/d74efc4b-3cd7-4a84-963a-1dbb186145c8" />
